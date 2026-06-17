@@ -304,24 +304,24 @@ img.emoji {
 
       <!-- API KEY CARD -->
       <div class="manage-card">
-        <h3>🔴 Live API Setup</h3>
+        <h3>🔴 Live Scores Setup</h3>
         <div class="notice-blue">
-          Get your <strong>free key</strong> at <a href="https://dashboard.api-football.com/register" target="_blank">api-football.com/register</a> — takes 2 min, 100 req/day free.<br><br>
-          <strong>How the polling works:</strong><br>
-          · On load: fetches today's fixtures (1 req)<br>
-          · No live game: checks for new results every <strong>5 min</strong> (1 req)<br>
-          · Live game detected: polls every <strong>60 sec</strong> for score + events (2 req/min)<br>
-          · API updated by football.api-sports.io every <strong>15 sec</strong>
+          <strong>Recommended:</strong> get a free key at <a href="https://www.football-data.org/client/register" target="_blank">football-data.org/client/register</a> — it works <strong>directly from the browser</strong> (no proxy needed) and World Cup is free forever.<br><br>
+          Paste it below. The dashboard polls every 60s during live games, every 15 min otherwise. If no key is set, completed scores still load automatically from the free openfootball feed.
         </div>
         <div class="form-row">
-          <label class="form-label">API-Football Key</label>
-          <input type="password" class="form-input" id="api-key-input" placeholder="Paste your key here…" autocomplete="off">
+          <label class="form-label">football-data.org Key (recommended)</label>
+          <input type="password" class="form-input" id="fdo-key-input" placeholder="Paste football-data.org key…" autocomplete="off">
+        </div>
+        <div class="form-row">
+          <label class="form-label">API-Football Key (optional backup)</label>
+          <input type="password" class="form-input" id="api-key-input" placeholder="Optional — routed via CORS proxy…" autocomplete="off">
         </div>
         <button class="btn btn-primary" onclick="saveKey()">Save & Activate</button>
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v12 · build Jun 17 · dedup-fixed</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v14 · build Jun 17 · football-data.org</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -399,12 +399,22 @@ img.emoji {
 <script>
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const API_DIRECT = 'https://v3.football.api-sports.io';
-// API-Football sends NO CORS headers, so browser calls are blocked.
-// We route through CORS proxies (tried in order until one works).
+// PRIMARY: football-data.org — CORS-native (works directly from browser with a free key),
+// World Cup is in their free-forever tier. Competition code WC, current season.
+const FDO_BASE = 'https://api.football-data.org/v4';
+const FDO_COMPETITION = 'WC'; // World Cup
+// API-Football sends NO CORS headers, so browser calls are blocked from a website.
+// We route through CORS proxies. corsproxy.io now restricts free tier to localhost,
+// so it's removed. These are confirmed working from hosted origins as of 2026:
 const CORS_PROXIES = [
-  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  // CodeTabs — works from any origin, ~5 req/sec
+  u => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}`,
+  // allorigins raw — ~20 req/min
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://thingproxy.freeboard.io/fetch/${u}`,
+  // corsfix — free for dev/open-source, no key
+  u => `https://proxy.corsfix.com/?${u}`,
+  // cors.x2u.in — ~100 req/hour
+  u => `https://cors.x2u.in/${u}`,
 ];
 let workingProxyIdx = parseInt(localStorage.getItem('wc26_proxyidx')||'0');
 // openfootball public-domain JSON (CORS-enabled via GitHub raw / jsdelivr) — keyless fallback
@@ -472,6 +482,7 @@ function findPoolTeam(apiName){
 // ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
 let S = JSON.parse(localStorage.getItem('wc26_v12')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
+let fdoKey = localStorage.getItem('wc26_fdokey') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
 let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v12')||'[]'));
 // Daily request counter (resets at midnight)
@@ -626,10 +637,85 @@ async function fetchOpenFootball(){
   return false;
 }
 
-// Get YYYY-MM-DD string offset by N days from today
-function dateStr(offsetDays=0){
-  const d = new Date(); d.setDate(d.getDate()+offsetDays);
-  return d.toISOString().slice(0,10);
+// ─── FOOTBALL-DATA.ORG (PRIMARY, CORS-native) ─────────────────────────────────
+// Maps football-data.org status → our buckets
+const FDO_LIVE = new Set(['IN_PLAY','PAUSED']);
+const FDO_DONE = new Set(['FINISHED','AWARDED']);
+async function fetchFootballData(){
+  if(!fdoKey) return false;
+  try{
+    // Fetch all WC matches; filter client-side. football-data.org sends CORS headers
+    // when the X-Auth-Token is present, so this works directly from the browser.
+    const r = await fetch(`${FDO_BASE}/competitions/${FDO_COMPETITION}/matches`, {
+      headers: { 'X-Auth-Token': fdoKey }
+    });
+    if(!r.ok){
+      debugLog(`football-data.org HTTP ${r.status}`);
+      return false;
+    }
+    const data = await r.json();
+    const matches = data.matches || [];
+    debugLog(`football-data.org: ${matches.length} WC matches`);
+
+    const nowLive = [];
+    let changed = false;
+    for(const m of matches){
+      const status = m.status;
+      const hName = m.homeTeam?.name || m.homeTeam?.shortName || '';
+      const aName = m.awayTeam?.name || m.awayTeam?.shortName || '';
+      const hg = m.score?.fullTime?.home;
+      const ag = m.score?.fullTime?.away;
+      const phase = detectPhaseFDO(m.stage, m.group);
+
+      if(FDO_LIVE.has(status)){
+        // Build a normalized live fixture object compatible with renderBanner/liveTeamPoints
+        nowLive.push(toFixtureShape(hName, aName, hg??0, ag??0, m.minute||m.injuryTime||'', status, phase, m.group||m.stage));
+      } else if(FDO_DONE.has(status) && hg!=null && ag!=null){
+        if(commitMatch(hName, aName, hg, ag, phase)) changed = true;
+      }
+    }
+
+    // Update live state from football-data.org
+    liveFixtures = nowLive;
+    if(changed){ save(); }
+    if(!nowLive.length) document.getElementById('live-banner').innerHTML='';
+    renderBanner();
+    renderLeaderboard();
+    renderTeams();
+    renderResults();
+    if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+    setSync(nowLive.length
+      ? `🔴 ${nowLive.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`
+      : `Updated · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
+    return true;
+  }catch(e){
+    debugLog(`football-data.org failed: ${e.message}`);
+    return false;
+  }
+}
+
+// Convert football-data.org match into the API-Football-shaped object the
+// rest of the app (renderBanner, liveTeamPoints, getLiveFixtureForTeam) expects
+function toFixtureShape(hName, aName, hg, ag, minute, status, phase, round){
+  const shortStatus = status==='PAUSED' ? 'HT' : '2H';
+  return {
+    fixture: { id: `fdo_${normName(hName)}_${normName(aName)}`, status:{ short:shortStatus, elapsed: typeof minute==='number'?minute:(parseInt(minute)||'') } },
+    teams: { home:{name:hName}, away:{name:aName} },
+    goals: { home:hg, away:ag },
+    score: { halftime:{home:null,away:null} },
+    league: { id:WC_LEAGUE, season:WC_SEASON, round: round||'Group Stage' }
+  };
+}
+
+function detectPhaseFDO(stage, group){
+  const s = (stage||'').toUpperCase();
+  if(s.includes('GROUP')) return 'group';
+  if(s.includes('LAST_32')||s.includes('ROUND_OF_32')) return 'r32';
+  if(s.includes('LAST_16')||s.includes('ROUND_OF_16')) return 'r16';
+  if(s.includes('QUARTER')) return 'qf';
+  if(s.includes('SEMI')) return 'sf';
+  if(s.includes('FINAL')) return 'final';
+  return 'group';
 }
 
 // Fetch fixtures for a given date, process finished ones, update live state
@@ -800,28 +886,44 @@ const IDLE_EVERY_TICKS = 15;           // 15 min when nothing live
 
 function startPolling(){
   if(pollTimer) clearInterval(pollTimer);
-  if(!apiKey){ setSync('Add your API key in Manage → Live API Setup'); return; }
   setSync('Fetching latest scores…');
-  fetchAllRecent();
+  doMasterFetch();
   let tick = 0;
   pollTimer = setInterval(()=>{
     tick++;
     const liveActive = liveFixtures.length > 0;
     const kickoffSoon = shouldCheckForLive();
     if(liveActive || kickoffSoon){
-      // Active window — poll every 6 min
       if(tick % LIVE_EVERY_TICKS === 0 || (kickoffSoon && !liveActive)){
-        debugLog(`Poll tick ${tick}: live/kickoff window → fetching`);
-        if(liveActive) fetchLiveFixtures(); else fetchAllRecent();
+        debugLog(`Poll tick ${tick}: live/kickoff window`);
+        doMasterFetch();
       }
     } else {
-      // Idle — poll every 15 min
       if(tick % IDLE_EVERY_TICKS === 0){
-        debugLog(`Poll tick ${tick}: idle → light fetch`);
-        fetchAllRecent();
+        debugLog(`Poll tick ${tick}: idle check`);
+        doMasterFetch();
       }
     }
   }, POLL_BASE_MS);
+}
+
+// Unified fetch: try sources in order of reliability.
+// 1) football-data.org (CORS-native, best) → 2) API-Football via proxy → 3) openfootball (finals only)
+async function doMasterFetch(){
+  // 1. football-data.org — works directly, includes live + finals
+  if(fdoKey){
+    const ok = await fetchFootballData();
+    if(ok) return;
+    debugLog('football-data.org returned nothing, trying next source');
+  }
+  // 2. API-Football via CORS proxy — live + events
+  if(apiKey){
+    const live = await fetchAllRecent();
+    if(live !== null && (todayFixtures.length || liveFixtures.length)) return;
+    debugLog('API-Football empty, falling back to openfootball');
+  }
+  // 3. openfootball — completed scores only, no key needed
+  await fetchOpenFootball();
 }
 
 // Returns true if any fixture kicks off within 10 min or started <130min ago and isn't finished
@@ -850,58 +952,51 @@ function debugLog(msg){
 }
 
 function saveKey(){
-  const val = document.getElementById('api-key-input').value.trim();
-  if(!val){ alert('Please enter a key.'); return; }
+  const fdoVal = document.getElementById('fdo-key-input').value.trim();
+  const apiVal = document.getElementById('api-key-input').value.trim();
+  const ks = document.getElementById('key-status');
+  ks.style.display='block';
 
-  // Warn if opening as file:// — CORS will block API calls
-  if(isFileProtocol()){
-    const ks = document.getElementById('key-status');
-    ks.style.display='block'; ks.className='key-status err';
-    ks.innerHTML = '⚠ You\'re opening this as a local file. API calls are blocked by CORS from <code>file://</code>.<br><strong>Upload to GitHub Pages first</strong>, then enter your key there — it will work perfectly once hosted.';
+  if(!fdoVal && !apiVal){
+    ks.className='key-status err';
+    ks.textContent='Enter at least one key (football-data.org recommended).';
     return;
   }
 
-  apiKey = val;
-  localStorage.setItem('wc26_key', apiKey);
-  const ks = document.getElementById('key-status');
-  ks.style.display='block'; ks.className='key-status ok'; ks.textContent='Testing connection…';
+  // Save both keys
+  if(fdoVal){ fdoKey = fdoVal; localStorage.setItem('wc26_fdokey', fdoKey); }
+  if(apiVal){ apiKey = apiVal; localStorage.setItem('wc26_key', apiKey); }
 
-  // /status does NOT count against quota
-  apiFetch('/status', true).then(d=>{
-    if(d?._corsError){
-      ks.className='key-status err';
-      ks.innerHTML='⚠ Could not reach API-Football through any CORS proxy. The dashboard will use the free openfootball feed for completed scores instead. Live in-match data may be unavailable.';
-      // Kick off openfootball fallback anyway
-      fetchOpenFootball();
-      return;
-    }
-    if(d?._httpError){
-      ks.className='key-status err';
-      ks.textContent=`⚠ HTTP ${d._httpError} — check your key is correct and active at dashboard.api-football.com`;
-      return;
-    }
-    if(d?._apiError){
-      ks.className='key-status err';
-      ks.textContent='⚠ Invalid API key — double-check you copied it correctly from your dashboard.';
-      return;
-    }
-    if(d?.response){
-      const sub = d.response.subscription;
-      const reqs = d.response.requests;
-      ks.className='key-status ok';
-      ks.textContent = `✓ Connected · Plan: ${sub?.plan||'Free'} · ${reqs?.current||0} / ${reqs?.limit_day||100} req used today`;
-      const used = reqs?.current || 0;
-      document.getElementById('usage-wrap').style.display='block';
-      document.getElementById('usage-fill').style.width = Math.min(used/100*100,100)+'%';
-      document.getElementById('usage-text').textContent = `${used} / ${reqs?.limit_day||100}`;
-      reqCount = used; saveReqCount();
-      startPolling();
-    } else {
-      ks.className='key-status err';
-      ks.textContent='⚠ Unexpected response — key saved, polling will still attempt to start.';
-      startPolling();
-    }
-  });
+  ks.className='key-status ok'; ks.textContent='Testing connection…';
+
+  // Test football-data.org first (the reliable one)
+  if(fdoKey){
+    fetch(`${FDO_BASE}/competitions/${FDO_COMPETITION}/matches`, { headers:{'X-Auth-Token':fdoKey} })
+      .then(r=>{
+        if(r.ok){
+          ks.className='key-status ok';
+          ks.textContent='✓ football-data.org connected — live scores active!';
+          startPolling();
+        } else if(r.status===403 || r.status===400){
+          ks.className='key-status err';
+          ks.textContent='⚠ football-data.org key rejected — double-check it. (Still trying other sources.)';
+          startPolling();
+        } else {
+          ks.className='key-status err';
+          ks.textContent=`⚠ football-data.org HTTP ${r.status}. Trying other sources…`;
+          startPolling();
+        }
+      })
+      .catch(e=>{
+        ks.className='key-status err';
+        ks.innerHTML='⚠ Could not reach football-data.org from the browser. This usually means you\'re on a local file — upload to GitHub Pages and try again.';
+        startPolling();
+      });
+  } else {
+    // Only API-Football key provided
+    ks.textContent='Testing API-Football via proxy…';
+    startPolling();
+  }
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
@@ -1176,7 +1271,7 @@ function renderManage(){
     const mp=Math.round(r.pts*mult*10)/10;
     return`<div class="log-item"><div class="log-left"><span>${t?(t.flag||'')+' '+t.name:'?'}</span><span class="phase-tag">${PS[r.phase]}</span><span style="text-transform:capitalize;font-size:10px;">${r.outcome}</span>${r.auto?'<span style="font-size:9px;color:var(--blue-dim);background:rgba(58,111,212,.1);padding:1px 5px;border-radius:3px;">auto</span>':''}</div><div style="display:flex;align-items:center;gap:7px;"><span class="log-pts">+${r.pts}→${mp}</span><button onclick="removeResult('${r.id}')">✕</button></div></div>`;
   }).join('');
-  if(apiKey) document.getElementById('api-key-input').value = apiKey;
+  if(apiKey){const e=document.getElementById('api-key-input');if(e)e.value=apiKey;} if(fdoKey){const e=document.getElementById('fdo-key-input');if(e)e.value=fdoKey;}
   saveReqCount();
 }
 
@@ -1205,9 +1300,8 @@ function removeResult(id){S.r=S.r.filter(r=>r.id!==id);render();}
 function resetAll(){doneFixtures=new Set();S={p:[],t:[],r:[],seeded:false};seedData();render();}
 function forceRefresh(){
   if(isFileProtocol()){alert('Live fetch needs the hosted GitHub Pages URL, not a local file.');return;}
-  if(!apiKey){alert('Add your API key first.');return;}
   setSync('Force refreshing…');
-  fetchAllRecent();
+  doMasterFetch();
 }
 function hardReset(){
   if(!confirm('This wipes saved data and reloads everything fresh (including latest seeded results). Continue?'))return;
@@ -1226,12 +1320,16 @@ function switchTab(tab){
 // ─── SCENARIOS TAB ───────────────────────────────────────────────────────────
 // Upcoming matches in pool order — expand as tournament progresses
 const UPCOMING_MATCHES = [
-  {g:'J',hf:'🇦🇷',h:'Argentina',af:'🇩🇿',a:'Algeria',  date:'Jun 16'},
-  {g:'J',hf:'🇦🇹',h:'Austria',  af:'🇯🇴',a:'Jordan',   date:'Jun 16'},
+  // Jun 17 (today)
   {g:'K',hf:'🇵🇹',h:'Portugal', af:'🇨🇩',a:'DR Congo', date:'Jun 17'},
-  {g:'K',hf:'🇺🇿',h:'Uzbekistan',af:'🇨🇴',a:'Colombia',date:'Jun 17'},
   {g:'L',hf:'🏴󠁧󠁢󠁥󠁮󠁧󠁿',h:'England',  af:'🇭🇷',a:'Croatia',  date:'Jun 17'},
   {g:'L',hf:'🇬🇭',h:'Ghana',    af:'🇵🇦',a:'Panama',   date:'Jun 17'},
+  {g:'K',hf:'🇺🇿',h:'Uzbekistan',af:'🇨🇴',a:'Colombia',date:'Jun 17'},
+  // Jun 18 (matchday 2 begins)
+  {g:'A',hf:'🇨🇿',h:'Czech Republic',af:'🇿🇦',a:'South Africa',date:'Jun 18'},
+  {g:'B',hf:'🇨🇭',h:'Switzerland',af:'🇧🇦',a:'Bosnia',  date:'Jun 18'},
+  {g:'B',hf:'🇨🇦',h:'Canada',   af:'🇶🇦',a:'Qatar',    date:'Jun 18'},
+  {g:'A',hf:'🇲🇽',h:'Mexico',   af:'🇰🇷',a:'South Korea',date:'Jun 18'},
 ];
 
 function renderScenarios(){
@@ -1258,12 +1356,27 @@ function renderScenarios(){
   let html = '';
 
   // ── Section 1: Upcoming match scenarios ──
+  // A match is "completed" if either team already has a logged result whose
+  // scoreline names the opponent — drop those so finished games disappear.
+  function matchAlreadyPlayed(m){
+    const ht = S.t.find(t=>t.name===m.h), at = S.t.find(t=>t.name===m.a);
+    // Check if home team has a result vs this away team (or vice versa)
+    const played = (team, oppName) => {
+      if(!team) return false;
+      return S.r.some(r=>r.tid===team.id && r.scoreline && r.scoreline.includes(normName(oppName)));
+    };
+    // Also fall back to the canonical done-key check
+    const key = matchKey(m.h, m.a, 'group');
+    return doneFixtures.has(key) || played(ht, m.a) || played(at, m.h);
+  }
+
   const upcoming = UPCOMING_MATCHES.filter(m=>{
-    // Only show if neither team has results yet for this game
     const ht = S.t.find(t=>t.name===m.h), at = S.t.find(t=>t.name===m.a);
     const hOwner = ht ? S.p.find(p=>p.id===ht.pid) : null;
     const aOwner = at ? S.p.find(p=>p.id===at.pid) : null;
-    return hOwner || aOwner; // at least one pool team involved
+    if(!(hOwner || aOwner)) return false;   // at least one pool team involved
+    if(matchAlreadyPlayed(m)) return false; // skip completed games
+    return true;
   });
 
   if(upcoming.length){
@@ -1551,18 +1664,19 @@ seedData();
 repairDuplicates();
 render();
 saveReqCount();
+// Restore saved keys into inputs
+if(fdoKey) { const el=document.getElementById('fdo-key-input'); if(el) el.value=fdoKey; }
+if(apiKey) { const el=document.getElementById('api-key-input'); if(el) el.value=apiKey; }
+
 if(isFileProtocol()){
   setSync('⚠ Local file — upload to GitHub Pages for live scores');
-  // Still try openfootball (it's CORS-enabled even from file:// in some browsers)
   fetchOpenFootball();
-} else if(apiKey){
-  setSync('Fetching latest scores…');
-  startPolling();
 } else {
-  setSync('No key — using free openfootball feed for results');
-  // No API key: poll openfootball every 10 min for completed scores
-  fetchOpenFootball();
-  setInterval(fetchOpenFootball, 600000);
+  // Always start the polling engine. doMasterFetch picks the best available source:
+  // football-data.org → API-Football proxy → openfootball. Works even with no key.
+  if(fdoKey || apiKey) setSync('Connecting to live source…');
+  else setSync('No key set — using free openfootball feed (completed scores)');
+  startPolling();
 }
 </script>
 </body>
