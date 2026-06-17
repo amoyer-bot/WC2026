@@ -321,7 +321,7 @@ img.emoji {
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v10 · build Jun 16 · live-aware</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v11 · build Jun 17 · CORS-proxied</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -398,7 +398,20 @@ img.emoji {
 
 <script>
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const API_BASE = 'https://v3.football.api-sports.io';
+const API_DIRECT = 'https://v3.football.api-sports.io';
+// API-Football sends NO CORS headers, so browser calls are blocked.
+// We route through CORS proxies (tried in order until one works).
+const CORS_PROXIES = [
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://thingproxy.freeboard.io/fetch/${u}`,
+];
+let workingProxyIdx = parseInt(localStorage.getItem('wc26_proxyidx')||'0');
+// openfootball public-domain JSON (CORS-enabled via GitHub raw / jsdelivr) — keyless fallback
+const OPENFOOTBALL_URLS = [
+  'https://cdn.jsdelivr.net/gh/openfootball/worldcup.json@master/2026/worldcup.json',
+  'https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json',
+];
 const WC_LEAGUE = 1;
 const WC_SEASON = 2026;
 // Match status: live phases
@@ -457,10 +470,10 @@ function findPoolTeam(apiName){
 }
 
 // ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
-let S = JSON.parse(localStorage.getItem('wc26_v10')||'null') || {p:[],t:[],r:[],seeded:false};
+let S = JSON.parse(localStorage.getItem('wc26_v11')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
-let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v10')||'[]'));
+let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v11')||'[]'));
 // Daily request counter (resets at midnight)
 let reqDay = localStorage.getItem('wc26_reqday') || '';
 let reqCount = 0;
@@ -480,8 +493,8 @@ function saveReqCount(){
 }
 
 function save(){
-  localStorage.setItem('wc26_v10', JSON.stringify(S));
-  localStorage.setItem('wc26_done_v10', JSON.stringify([...doneFixtures]));
+  localStorage.setItem('wc26_v11', JSON.stringify(S));
+  localStorage.setItem('wc26_done_v11', JSON.stringify([...doneFixtures]));
 }
 
 // ─── LIVE STATE (in-memory only) ──────────────────────────────────────────────
@@ -551,25 +564,76 @@ function isFileProtocol(){ return location.protocol === 'file:'; }
 async function apiFetch(endpoint, skipCount=false){
   if(!apiKey) return null;
   if(!skipCount){ reqCount++; saveReqCount(); }
-  try{
-    const r = await fetch(`${API_BASE}${endpoint}`, {
-      headers: { 'x-apisports-key': apiKey }
-    });
-    if(!r.ok){
-      console.warn('API HTTP err', r.status);
-      return { _httpError: r.status };
+  const directUrl = `${API_DIRECT}${endpoint}`;
+
+  // Try proxies starting from the last one that worked
+  for(let attempt=0; attempt<CORS_PROXIES.length; attempt++){
+    const idx = (workingProxyIdx + attempt) % CORS_PROXIES.length;
+    const proxiedUrl = CORS_PROXIES[idx](directUrl);
+    try{
+      const r = await fetch(proxiedUrl, {
+        headers: { 'x-apisports-key': apiKey, 'Accept':'application/json' }
+      });
+      if(!r.ok){
+        debugLog(`Proxy ${idx} HTTP ${r.status}`);
+        continue; // try next proxy
+      }
+      const text = await r.text();
+      let json;
+      try{ json = JSON.parse(text); }
+      catch(e){ debugLog(`Proxy ${idx} bad JSON`); continue; }
+      // Check API-level errors (bad key etc.)
+      if(json.errors && (Array.isArray(json.errors)?json.errors.length:Object.keys(json.errors).length)){
+        debugLog(`API error: ${JSON.stringify(json.errors)}`);
+        return { _apiError: json.errors };
+      }
+      // Success — remember this proxy
+      if(idx !== workingProxyIdx){
+        workingProxyIdx = idx;
+        localStorage.setItem('wc26_proxyidx', String(idx));
+        debugLog(`Switched to proxy ${idx}`);
+      }
+      return json;
+    }catch(e){
+      debugLog(`Proxy ${idx} failed: ${e.message}`);
+      continue;
     }
-    const json = await r.json();
-    // API returns errors array when key is invalid
-    if(json.errors && (Array.isArray(json.errors) ? json.errors.length : Object.keys(json.errors).length)){
-      console.warn('API errors:', json.errors);
-      return { _apiError: json.errors };
-    }
-    return json;
-  }catch(e){
-    console.warn('Fetch err', e.message);
-    return { _corsError: e.message };
   }
+  debugLog('All proxies failed — will try openfootball fallback');
+  return { _corsError: 'all proxies failed' };
+}
+
+// ─── OPENFOOTBALL FALLBACK (keyless, public domain, CORS-enabled) ─────────────
+// Used when API-Football proxies all fail. Provides completed + scheduled scores.
+async function fetchOpenFootball(){
+  for(const url of OPENFOOTBALL_URLS){
+    try{
+      const r = await fetch(url, {cache:'no-store'});
+      if(!r.ok) continue;
+      const data = await r.json();
+      const matches = data.matches || [];
+      debugLog(`openfootball: ${matches.length} matches loaded`);
+      let changed = false;
+      const now = Date.now();
+      for(const m of matches){
+        if(!m.score || !m.score.ft) continue; // not finished
+        const key = 'of_'+(m.team1||'')+'_'+(m.team2||'')+'_'+(m.date||'');
+        if(doneFixtures.has(key)) continue;
+        const [hg, ag] = m.score.ft;
+        const t1 = findPoolTeam(m.team1), t2 = findPoolTeam(m.team2);
+        const phase = detectPhase(m.round||m.group||'');
+        const o1 = hg>ag?'win':hg===ag?'draw':'loss';
+        const o2 = ag>hg?'win':hg===ag?'draw':'loss';
+        if(t1){ S.r.push({id:uid(),tid:t1.id,phase,outcome:o1,pts:calcPts(phase,o1),ts:now,auto:true,fid:key,scoreline:`${hg}–${ag} vs ${normName(m.team2)}`}); }
+        if(t2){ S.r.push({id:uid(),tid:t2.id,phase,outcome:o2,pts:calcPts(phase,o2),ts:now,auto:true,fid:key,scoreline:`${ag}–${hg} vs ${normName(m.team1)}`}); }
+        doneFixtures.add(key);
+        if(t1||t2) changed = true;
+      }
+      if(changed){ save(); render(); }
+      return true;
+    }catch(e){ debugLog(`openfootball ${url} failed: ${e.message}`); }
+  }
+  return false;
 }
 
 // Get YYYY-MM-DD string offset by N days from today
@@ -581,7 +645,11 @@ function dateStr(offsetDays=0){
 // Fetch fixtures for a given date, process finished ones, update live state
 async function fetchFixturesForDate(date){
   const data = await apiFetch(`/fixtures?league=${WC_LEAGUE}&season=${WC_SEASON}&date=${date}`);
-  if(!data || data._corsError || data._httpError || data._apiError || !data.response) return [];
+  if(!data || data._corsError || data._httpError || data._apiError || !data.response){
+    if(data && data._apiError) debugLog('Date fetch API error '+date);
+    return [];
+  }
+  debugLog(`${date}: ${data.response.length} fixtures from API`);
   return data.response;
 }
 
@@ -593,6 +661,13 @@ async function fetchAllRecent(){
     fetchFixturesForDate(dateStr(1)),
   ]);
   const all = [...yest, ...today, ...tmrw];
+
+  // If API-Football returned nothing (all proxies down), use openfootball for finals
+  if(all.length === 0){
+    debugLog('API empty — using openfootball fallback for completed scores');
+    await fetchOpenFootball();
+    return [];
+  }
   todayFixtures = [...today, ...tmrw]; // include tomorrow for upcoming display
 
   const nowLive = all.filter(f => LIVE_STATUSES.has(f.fixture?.status?.short));
@@ -800,7 +875,9 @@ function saveKey(){
   apiFetch('/status', true).then(d=>{
     if(d?._corsError){
       ks.className='key-status err';
-      ks.textContent='⚠ CORS error — make sure you\'re viewing this from a hosted URL (GitHub Pages), not a local file.';
+      ks.innerHTML='⚠ Could not reach API-Football through any CORS proxy. The dashboard will use the free openfootball feed for completed scores instead. Live in-match data may be unavailable.';
+      // Kick off openfootball fallback anyway
+      fetchOpenFootball();
       return;
     }
     if(d?._httpError){
@@ -837,7 +914,7 @@ function saveKey(){
 // Stores a snapshot of standings taken at the START of each calendar day.
 // Movement (▲/▼) compares the CURRENT live standings against that morning snapshot,
 // so it reflects everything that happened across all of today's games and resets daily.
-let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v10')||'null');
+let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v11')||'null');
 // dailySnap = { date:'YYYY-MM-DD', ranks:{pid:rank} }
 
 function maybeRollDailySnapshot(rankedConfirmed){
@@ -848,7 +925,7 @@ function maybeRollDailySnapshot(rankedConfirmed){
     const ranks = {};
     rankedConfirmed.forEach((p,i)=>ranks[p.id]=i+1);
     dailySnap = { date: today, ranks };
-    localStorage.setItem('wc26_dailysnap_v10', JSON.stringify(dailySnap));
+    localStorage.setItem('wc26_dailysnap_v11', JSON.stringify(dailySnap));
     debugLog(`New daily snapshot captured for ${today}`);
   }
 }
@@ -1459,11 +1536,16 @@ render();
 saveReqCount();
 if(isFileProtocol()){
   setSync('⚠ Local file — upload to GitHub Pages for live scores');
+  // Still try openfootball (it's CORS-enabled even from file:// in some browsers)
+  fetchOpenFootball();
 } else if(apiKey){
   setSync('Fetching latest scores…');
   startPolling();
 } else {
-  setSync('Add your API key in Manage to enable live scores');
+  setSync('No key — using free openfootball feed for results');
+  // No API key: poll openfootball every 10 min for completed scores
+  fetchOpenFootball();
+  setInterval(fetchOpenFootball, 600000);
 }
 </script>
 </body>
