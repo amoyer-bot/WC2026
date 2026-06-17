@@ -516,32 +516,78 @@ async function apiFetch(endpoint, skipCount=false){
   }
 }
 
-// Fetch all of today's WC fixtures (completed + live + upcoming)
-async function fetchTodayFixtures(){
-  const data = await apiFetch(`/fixtures?league=${WC_LEAGUE}&season=${WC_SEASON}&date=${TODAY}`);
-  if(!data || data._corsError || data._httpError || data._apiError || !data.response) return;
-  todayFixtures = data.response;
-  processFixtures(data.response);
-  renderResults();
-  setSync('Updated · ' + new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
+// Get YYYY-MM-DD string offset by N days from today
+function dateStr(offsetDays=0){
+  const d = new Date(); d.setDate(d.getDate()+offsetDays);
+  return d.toISOString().slice(0,10);
 }
 
-// Fetch only currently-live WC fixtures — most efficient for polling
+// Fetch fixtures for a given date, process finished ones, update live state
+async function fetchFixturesForDate(date){
+  const data = await apiFetch(`/fixtures?league=${WC_LEAGUE}&season=${WC_SEASON}&date=${date}`);
+  if(!data || data._corsError || data._httpError || data._apiError || !data.response) return [];
+  return data.response;
+}
+
+// Master fetch: grabs yesterday + today, processes all finished, updates live list
+async function fetchAllRecent(){
+  // Fetch yesterday and today in parallel to catch late finishers
+  const [yest, today] = await Promise.all([
+    fetchFixturesForDate(dateStr(-1)),
+    fetchFixturesForDate(dateStr(0)),
+  ]);
+  const all = [...yest, ...today];
+  todayFixtures = today;
+
+  // Separate live vs finished
+  const nowLive = all.filter(f => LIVE_STATUSES.has(f.fixture?.status?.short));
+  const finished = all.filter(f => FT_STATUSES.has(f.fixture?.status?.short));
+
+  // Update liveFixtures global
+  liveFixtures = nowLive;
+
+  // Process finished → commit to pool scoring
+  processFixtures(finished);
+
+  // Fetch events for live games
+  for(const f of nowLive){ await fetchEvents(f.fixture.id); }
+
+  // Update UI
+  if(!nowLive.length) document.getElementById('live-banner').innerHTML='';
+  renderBanner();
+  renderLeaderboard();
+  renderTeams();
+  renderResults();
+  if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+
+  const liveCount = nowLive.length;
+  setSync(liveCount>0
+    ? `🔴 ${liveCount} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`
+    : `Updated · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`
+  );
+  return nowLive;
+}
+
+// Lightweight live-only poll (used when we know a game is in progress)
 async function fetchLiveFixtures(){
   const data = await apiFetch(`/fixtures?live=${WC_LEAGUE}`);
   if(!data || data._corsError || data._httpError || data._apiError) return;
   const wcLive = (data.response||[]).filter(f => f.league?.id === WC_LEAGUE);
   liveFixtures = wcLive;
-  processFixtures(wcLive);
+  processFixtures(wcLive); // catches any that just finished
   for(const f of wcLive){ await fetchEvents(f.fixture.id); }
-  // If no live matches, clear banner
-  if(!wcLive.length) document.getElementById('live-banner').innerHTML = '';
+  if(!wcLive.length){
+    document.getElementById('live-banner').innerHTML='';
+    // Game just ended — do a full fetch to catch the FT result
+    await fetchAllRecent();
+    return;
+  }
   renderBanner();
   if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
   renderLeaderboard();
   renderTeams();
   renderResults();
-  setSync('🔴 Live · ' + new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
+  setSync(`🔴 ${wcLive.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
 }
 
 // Fetch events (goals, cards) for a fixture and cache them
@@ -557,25 +603,44 @@ function processFixtures(fixtures){
   const now = Date.now();
   for(const f of fixtures){
     const fid = String(f.fixture.id);
-    const status = f.fixture.status.short;
-    if(!FT_STATUSES.has(status)) continue;  // not finished
-    if(doneFixtures.has(fid)) continue;       // already logged
-    const hGoals = f.goals.home ?? 0;
-    const aGoals = f.goals.away ?? 0;
-    const hName = f.teams.home.name;
-    const aName = f.teams.away.name;
+    const status = f.fixture?.status?.short;
+    if(!status || !FT_STATUSES.has(status)) continue; // not finished
+    if(doneFixtures.has(fid)) continue;                // already logged
+
+    const hGoals = f.goals?.home ?? 0;
+    const aGoals = f.goals?.away ?? 0;
+    const hName = f.teams?.home?.name || '';
+    const aName = f.teams?.away?.name || '';
     const hTeam = findPoolTeam(hName);
     const aTeam = findPoolTeam(aName);
+
+    // Store match scoreline for display in leaderboard breakdown
+    const scoreKey = normName(hName)+'|'+normName(aName);
+    matchScoreCache[scoreKey] = {h:normName(hName),a:normName(aName),hg:hGoals,ag:aGoals};
+
     const hOut = hGoals > aGoals ? 'win' : hGoals === aGoals ? 'draw' : 'loss';
     const aOut = aGoals > hGoals ? 'win' : hGoals === aGoals ? 'draw' : 'loss';
-    const phase = detectPhase(f.league.round);
-    if(hTeam){ S.r.push({id:uid(),tid:hTeam.id,phase,outcome:hOut,pts:calcPts(phase,hOut),ts:now,auto:true,fid}); }
-    if(aTeam){ S.r.push({id:uid(),tid:aTeam.id,phase,outcome:aOut,pts:calcPts(phase,aOut),ts:now,auto:true,fid}); }
+    const phase = detectPhase(f.league?.round || '');
+
+    console.log(`[WC26] Processing: ${hName} ${hGoals}-${aGoals} ${aName} | phase:${phase} | hTeam:${hTeam?.name||'none'} aTeam:${aTeam?.name||'none'}`);
+
+    if(hTeam){
+      S.r.push({id:uid(),tid:hTeam.id,phase,outcome:hOut,pts:calcPts(phase,hOut),ts:now,auto:true,fid,
+        scoreline:`${hGoals}–${aGoals} vs ${normName(aName)}`});
+    }
+    if(aTeam){
+      S.r.push({id:uid(),tid:aTeam.id,phase,outcome:aOut,pts:calcPts(phase,aOut),ts:now,auto:true,fid,
+        scoreline:`${aGoals}–${hGoals} vs ${normName(hName)}`});
+    }
     doneFixtures.add(fid);
-    changed = true;
+    if(hTeam||aTeam) changed = true;
+    else changed = true; // still mark done so we don't recheck
   }
   if(changed){ save(); render(); }
 }
+
+// Cache of actual scores from API {h|a -> {hg,ag}}
+const matchScoreCache = {};
 
 function detectPhase(round){
   if(!round) return 'group';
@@ -596,38 +661,32 @@ let isMatchDay = false;
 function startPolling(){
   if(pollTimer) clearInterval(pollTimer);
   if(!apiKey){ setSync('Add your API key in Manage → Live API Setup'); return; }
-  // Initial load
-  fetchTodayFixtures();
-  // Poll every 60s — if live match running, also fetch live; if not, just check today's results every 5 min
+  setSync('Fetching latest scores…');
+  // Initial load: fetch yesterday + today to catch any missed results
+  fetchAllRecent();
   let tick = 0;
   pollTimer = setInterval(()=>{
     tick++;
     if(liveFixtures.length > 0){
-      // There's a live match — poll live every tick (60s)
+      // Live match in progress — poll every 60s for score + events
       fetchLiveFixtures();
-    } else if(tick % 5 === 0){
-      // No live match — check today's results every 5 min (tick 5, 10, 15…)
-      fetchTodayFixtures();
-    } else {
-      // Check if any games should be starting (look at todayFixtures kick-off times)
-      checkForKickoffs();
+    } else if(shouldCheckForLive() || tick % 5 === 0){
+      // Near a kickoff time OR every 5 min — full fetch
+      fetchAllRecent();
     }
-  }, 60000); // 60 second base tick
-  setSync('API active · polling every 60s');
+  }, 60000);
 }
 
-function checkForKickoffs(){
+// Returns true if any today fixture has a kickoff within the next 10 min or started <130min ago
+function shouldCheckForLive(){
   const nowMs = Date.now();
   for(const f of todayFixtures){
+    if(FT_STATUSES.has(f.fixture?.status?.short)) continue;
     const ko = new Date(f.fixture.date).getTime();
-    const elapsed = nowMs - ko;
-    // If kickoff was 0–120 min ago and not finished/not yet tracked as live
-    if(elapsed >= 0 && elapsed < 130 * 60000 && !FT_STATUSES.has(f.fixture.status.short)){
-      // Probably live — trigger live fetch
-      fetchLiveFixtures();
-      return;
-    }
+    const delta = nowMs - ko;
+    if(delta >= -600000 && delta < 130*60000) return true; // within 10min before or 130min after KO
   }
+  return false;
 }
 
 function setSync(msg){ const el=document.getElementById('sync-label'); if(el) el.textContent=msg; }
@@ -782,14 +841,22 @@ function renderLeaderboard(){
   document.getElementById('leaderboard-list').innerHTML = ranked.map((p,i)=>{
     const rk=i+1, rc=rk===1?'r1':rk===2?'r2':rk===3?'r3':'';
     const pills = [...p.teams].sort((a,b)=>a.rank-b.rank).map(t=>{
-      const lf = liveFixtures.find(f=>normName(f.teams.home.name)===t.name||normName(f.teams.away.name)===t.name);
-      return `<span class="pill ${pillClass(t.rank)}">${t.flag||''} ${t.name}${lf?' 🔴':''}</span>`;
+      // Check both live fixtures AND today's fixtures with live status
+      const allLive = [...liveFixtures, ...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
+      const lf = allLive.find(f=>
+        normName(f.teams?.home?.name||'')===t.name||normName(f.teams?.away?.name||'')===t.name
+      );
+      const indicator = lf ? ' <span style="display:inline-block;width:6px;height:6px;background:var(--accent-hi);border-radius:50%;vertical-align:middle;animation:blink 1s infinite;margin-left:2px;"></span>' : '';
+      return `<span class="pill ${pillClass(t.rank)}">${t.flag||''} ${t.name}${indicator}</span>`;
     }).join('');
     const rows = [...p.teams].sort((a,b)=>a.rank-b.rank).map(t=>{
       const sc = teamScore(t.id);
       const rs = S.r.filter(r=>r.tid===t.id);
       // Live chip
-      const lf = liveFixtures.find(f=>normName(f.teams.home.name)===t.name||normName(f.teams.away.name)===t.name);
+      const allCurrent = [...liveFixtures, ...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
+      const lf = allCurrent.find(f=>
+        normName(f.teams?.home?.name||'')===t.name||normName(f.teams?.away?.name||'')===t.name
+      );
       let liveChip = '';
       if(lf){
         const isHome = normName(lf.teams.home.name)===t.name;
@@ -799,18 +866,23 @@ function renderLeaderboard(){
         const min = lf.fixture.status.short==='HT'?'HT':lf.fixture.status.elapsed+"'";
         liveChip = `<span class="chip chip-live">LIVE ${min} · ${stat} ${my??0}–${opp??0}</span>`;
       }
-      // Build scoreline chips with actual match scores
-      const poolTeamResults = MATCH_RESULTS_BY_TEAM[t.name] || [];
+      // Build scoreline chips — use stored scoreline from API or MATCH_RESULTS_BY_TEAM lookup
+      const staticResults = MATCH_RESULTS_BY_TEAM[t.name] || [];
+      let staticIdx = 0;
       const chips = rs.length
         ? rs.map(r=>{
-            const matchInfo = poolTeamResults[rs.indexOf(r)] || null;
             let label;
-            if(matchInfo){
-              label = `${matchInfo.myScore}–${matchInfo.oppScore} vs ${matchInfo.opp}`;
+            if(r.scoreline){
+              // Stored directly on result from API
+              label = r.scoreline;
             } else {
-              label = `${PS[r.phase]} ${r.outcome[0].toUpperCase()+r.outcome.slice(1)}`;
+              // Fall back to static seed lookup
+              const matchInfo = staticResults[staticIdx++] || null;
+              label = matchInfo
+                ? `${matchInfo.myScore}–${matchInfo.oppScore} vs ${matchInfo.opp}`
+                : `${PS[r.phase]} ${r.outcome[0].toUpperCase()+r.outcome.slice(1)}`;
             }
-            return `<span class="chip chip-${r.outcome}" title="+${r.pts} pts">${label}</span>`;
+            return `<span class="chip chip-${r.outcome}" title="+${r.pts} pts">${label} <span style="opacity:.6;font-size:9px;">+${r.pts}</span></span>`;
           }).join('')+liveChip
         : liveChip || `<span class="chip chip-none">No results yet</span>`;
       return `<div class="team-row">
@@ -896,7 +968,8 @@ function renderTeams(){
     const sc=teamScore(t.id);
     const rs=S.r.filter(r=>r.tid===t.id);
     const phase=rs.length?PL[rs.reduce((l,r)=>PO.indexOf(r.phase)>PO.indexOf(l.phase)?r:l).phase]:'Not started';
-    const isLive=liveFixtures.some(f=>normName(f.teams.home.name)===t.name||normName(f.teams.away.name)===t.name);
+    const allCurr=[...liveFixtures,...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
+    const isLive=allCurr.some(f=>normName(f.teams?.home?.name||'')===t.name||normName(f.teams?.away?.name||'')===t.name);
     return `<div class="team-card"${isLive?' style="border-color:rgba(178,34,52,.5)"':''}>
       <div class="tc-top">
         <div class="tc-name">${t.flag||''} ${t.name}${isLive?' 🔴':''}</div>
@@ -1182,6 +1255,10 @@ const MATCH_RESULTS_BY_TEAM = (()=>{
   add('Iran',2,2,'New Zealand','G','Jun 15');
   add('France',3,1,'Senegal','I','Jun 16');
   add('Norway',4,1,'Iraq','I','Jun 16');
+  // Jun 15 (seeded but needed for chip display on older results)
+  add('Belgium',1,1,'Egypt','G','Jun 15');
+  add('Saudi Arabia',1,1,'Uruguay','H','Jun 15');
+  add('Iran',2,2,'New Zealand','G','Jun 15');
   return lookup;
 })();
 
@@ -1266,12 +1343,12 @@ seedData();
 render();
 saveReqCount();
 if(isFileProtocol()){
-  setSync('⚠ Local file — upload to GitHub Pages to enable live scores');
+  setSync('⚠ Local file — upload to GitHub Pages for live scores');
 } else if(apiKey){
-  document.getElementById('sync-label').textContent = 'API key loaded — connecting…';
+  setSync('Fetching latest scores…');
   startPolling();
 } else {
-  setSync('Add your API key in Manage → Live API Setup');
+  setSync('Add your API key in Manage to enable live scores');
 }
 </script>
 </body>
