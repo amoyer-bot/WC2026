@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>WC26 Pool · Live</title>
 <script src="https://cdn.jsdelivr.net/npm/twemoji@14.0.2/dist/twemoji.min.js" crossorigin="anonymous"></script>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -315,7 +318,10 @@ img.emoji {
           <input type="password" class="form-input" id="api-key-input" placeholder="Paste your key here…" autocomplete="off">
         </div>
         <button class="btn btn-primary" onclick="saveKey()">Save & Activate</button>
+        <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
+        <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v9 · build Jun 16</div>
         <div class="usage-bar-wrap" id="usage-wrap" style="display:none;">
           <div class="usage-bar-label"><span>Daily requests used</span><span id="usage-text">0 / 100</span></div>
           <div class="usage-bar"><div class="usage-bar-fill" id="usage-fill" style="width:0%"></div></div>
@@ -444,10 +450,10 @@ function findPoolTeam(apiName){
 }
 
 // ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
-let S = JSON.parse(localStorage.getItem('wc26_v8')||'null') || {p:[],t:[],r:[],seeded:false};
+let S = JSON.parse(localStorage.getItem('wc26_v9')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
-let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done')||'[]'));
+let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v9')||'[]'));
 // Daily request counter (resets at midnight)
 let reqDay = localStorage.getItem('wc26_reqday') || '';
 let reqCount = 0;
@@ -467,8 +473,8 @@ function saveReqCount(){
 }
 
 function save(){
-  localStorage.setItem('wc26_v8', JSON.stringify(S));
-  localStorage.setItem('wc26_done', JSON.stringify([...doneFixtures]));
+  localStorage.setItem('wc26_v9', JSON.stringify(S));
+  localStorage.setItem('wc26_done_v9', JSON.stringify([...doneFixtures]));
 }
 
 // ─── LIVE STATE (in-memory only) ──────────────────────────────────────────────
@@ -478,15 +484,58 @@ let liveFixtures = [];
 let todayFixtures = [];
 
 // ─── SCORE HELPERS ────────────────────────────────────────────────────────────
-function teamScore(tid){
+// Returns the current live fixture (if any) involving this pool team
+function getLiveFixtureForTeam(teamName){
+  const all = [...liveFixtures, ...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
+  // de-dup by fixture id
+  const seen = new Set();
+  for(const f of all){
+    const fid = f.fixture?.id;
+    if(seen.has(fid)) continue; seen.add(fid);
+    const h = normName(f.teams?.home?.name||'');
+    const a = normName(f.teams?.away?.name||'');
+    if(h===teamName || a===teamName) return f;
+  }
+  return null;
+}
+
+// Compute the PROVISIONAL points a team is earning from a live game right now
+function liveTeamPoints(team){
+  const lf = getLiveFixtureForTeam(team.name);
+  if(!lf) return null;
+  const isHome = normName(lf.teams.home.name)===team.name;
+  const my  = (isHome ? lf.goals.home : lf.goals.away) ?? 0;
+  const opp = (isHome ? lf.goals.away : lf.goals.home) ?? 0;
+  const outcome = my>opp ? 'win' : my===opp ? 'draw' : 'loss';
+  const phase = detectPhase(lf.league?.round||'');
+  const rawPts = calcPts(phase, outcome);
+  const mult = multiplierOf(team.rank);
+  return {
+    outcome, my, opp, rawPts,
+    total: Math.round(rawPts*mult*10)/10,
+    minute: lf.fixture.status.short==='HT' ? 'HT' : (lf.fixture.status.elapsed||'')+"'",
+    opp_name: isHome ? normName(lf.teams.away.name) : normName(lf.teams.home.name),
+    isHome
+  };
+}
+
+// teamScore: includeLive adds provisional live points
+function teamScore(tid, includeLive=true){
   const rs=S.r.filter(r=>r.tid===tid);
   const raw=rs.reduce((a,r)=>a+r.pts,0);
   const team=S.t.find(t=>t.id===tid);
   const mult=team?multiplierOf(team.rank):1;
-  return{raw,total:Math.round(raw*mult*10)/10,mult};
+  let total = Math.round(raw*mult*10)/10;
+  let livePts = null;
+  if(includeLive && team){
+    const lp = liveTeamPoints(team);
+    if(lp){ livePts = lp; total = Math.round((total + lp.total)*10)/10; }
+  }
+  return {raw, total, mult, livePts};
 }
-function ownerScore(pid){
-  return S.t.filter(t=>t.pid===pid).reduce((s,t)=>s+teamScore(t.id).total,0);
+
+function ownerScore(pid, includeLive=true){
+  return S.t.filter(t=>t.pid===pid).reduce((s,t)=>s+teamScore(t.id, includeLive).total, 0);
 }
 
 // ─── API CALLS ────────────────────────────────────────────────────────────────
@@ -746,13 +795,13 @@ function saveKey(){
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
 // Store previous rank snapshot (persisted per session)
-let prevRanks = JSON.parse(sessionStorage.getItem('wc26_prevranks')||'null');
+let prevRanks = JSON.parse(sessionStorage.getItem('wc26_prevranks_v9')||'null');
 function snapshotRanks(ranked){
   // Only update snapshot once per session on first render
   if(!prevRanks){
     prevRanks = {};
     ranked.forEach((p,i)=>{ prevRanks[p.id]=i+1; });
-    sessionStorage.setItem('wc26_prevranks', JSON.stringify(prevRanks));
+    sessionStorage.setItem('wc26_prevranks_v9', JSON.stringify(prevRanks));
   }
 }
 function getRankMove(pid, currentRank){
@@ -797,8 +846,8 @@ function renderBanner(){
     const hProj = hTeam ? Math.round(calcPts('group',hOut)*multiplierOf(hTeam.rank)*10)/10 : 0;
     const aProj = aTeam ? Math.round(calcPts('group',aOut)*multiplierOf(aTeam.rank)*10)/10 : 0;
     const impacts = [
-      hOwner&&hProj>0 ? `<span class="impact-chip impact-pos">+${hProj} pts → ${hOwner.name}</span>` : '',
-      aOwner&&aProj>0 ? `<span class="impact-chip impact-pos">+${aProj} pts → ${aOwner.name}</span>` : '',
+      hOwner ? `<span class="impact-chip ${hProj>0?'impact-pos':'impact-neu'}">${hOwner.name}: ${hProj>0?'+':''}${hProj} live pts (${hOut})</span>` : '',
+      aOwner ? `<span class="impact-chip ${aProj>0?'impact-pos':'impact-neu'}">${aOwner.name}: ${aProj>0?'+':''}${aProj} live pts (${aOut})</span>` : '',
       !hOwner&&!aOwner ? '<span class="impact-chip impact-neu">Neither team in pool</span>' : '',
     ].filter(Boolean).join('');
     const grp = f.league.round || '';
@@ -834,37 +883,33 @@ function renderBanner(){
 function renderLeaderboard(){
   document.getElementById('match-meta').textContent = `${doneFixtures.size} matches logged`;
   const ranked = [...S.p]
-    .map(p=>({...p, score:ownerScore(p.id), teams:S.t.filter(t=>t.pid===p.id)}))
+    .map(p=>{
+      const teams = S.t.filter(t=>t.pid===p.id);
+      const hasLive = teams.some(t=>liveTeamPoints(t)!==null);
+      return {...p, score:ownerScore(p.id), teams, hasLive};
+    })
     .sort((a,b)=>b.score-a.score);
   snapshotRanks(ranked);
 
   document.getElementById('leaderboard-list').innerHTML = ranked.map((p,i)=>{
     const rk=i+1, rc=rk===1?'r1':rk===2?'r2':rk===3?'r3':'';
     const pills = [...p.teams].sort((a,b)=>a.rank-b.rank).map(t=>{
-      // Check both live fixtures AND today's fixtures with live status
-      const allLive = [...liveFixtures, ...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
-      const lf = allLive.find(f=>
-        normName(f.teams?.home?.name||'')===t.name||normName(f.teams?.away?.name||'')===t.name
-      );
-      const indicator = lf ? ' <span style="display:inline-block;width:6px;height:6px;background:var(--accent-hi);border-radius:50%;vertical-align:middle;animation:blink 1s infinite;margin-left:2px;"></span>' : '';
+      const lp = liveTeamPoints(t);
+      const indicator = lp
+        ? ` <span style="display:inline-block;width:6px;height:6px;background:var(--accent-hi);border-radius:50%;vertical-align:middle;animation:blink 1s infinite;margin-left:2px;"></span>`
+        : '';
       return `<span class="pill ${pillClass(t.rank)}">${t.flag||''} ${t.name}${indicator}</span>`;
     }).join('');
     const rows = [...p.teams].sort((a,b)=>a.rank-b.rank).map(t=>{
       const sc = teamScore(t.id);
       const rs = S.r.filter(r=>r.tid===t.id);
-      // Live chip
-      const allCurrent = [...liveFixtures, ...todayFixtures.filter(f=>LIVE_STATUSES.has(f.fixture?.status?.short))];
-      const lf = allCurrent.find(f=>
-        normName(f.teams?.home?.name||'')===t.name||normName(f.teams?.away?.name||'')===t.name
-      );
+      // Live chip — shows provisional points being earned right now
+      const lp = liveTeamPoints(t);
       let liveChip = '';
-      if(lf){
-        const isHome = normName(lf.teams.home.name)===t.name;
-        const my = isHome?lf.goals.home:lf.goals.away;
-        const opp = isHome?lf.goals.away:lf.goals.home;
-        const stat = my>opp?'Winning':my===opp?'Drawing':'Losing';
-        const min = lf.fixture.status.short==='HT'?'HT':lf.fixture.status.elapsed+"'";
-        liveChip = `<span class="chip chip-live">LIVE ${min} · ${stat} ${my??0}–${opp??0}</span>`;
+      if(lp){
+        const stat = lp.outcome==='win'?'Winning':lp.outcome==='draw'?'Drawing':'Losing';
+        const sign = lp.total>0?'+':'';
+        liveChip = `<span class="chip chip-live">🔴 LIVE ${lp.minute} · ${stat} ${lp.my}–${lp.opp} vs ${lp.opp_name} · ${sign}${lp.total} provisional</span>`;
       }
       // Build scoreline chips — use stored scoreline from API or MATCH_RESULTS_BY_TEAM lookup
       const staticResults = MATCH_RESULTS_BY_TEAM[t.name] || [];
@@ -885,13 +930,15 @@ function renderLeaderboard(){
             return `<span class="chip chip-${r.outcome}" title="+${r.pts} pts">${label} <span style="opacity:.6;font-size:9px;">+${r.pts}</span></span>`;
           }).join('')+liveChip
         : liveChip || `<span class="chip chip-none">No results yet</span>`;
+      const liveMarker = sc.livePts ? `<span style="color:var(--accent-hi);font-size:10px;"> +${sc.livePts.total} live</span>` : '';
+      const ptsColor = sc.livePts ? 'color:var(--accent-hi);' : '';
       return `<div class="team-row">
         <div class="team-row-left"><span class="tr-flag">${t.flag||'🏳️'}</span>
           <div><div class="team-row-name">${t.name}</div>
           <div class="team-row-meta">Tier ${tierOf(t.rank)} · #${t.rank} · ${sc.mult}×</div></div>
         </div>
         <div class="result-chips">${chips}</div>
-        <div><div class="team-pts">${sc.total}</div><div class="team-pts-raw">${sc.raw} raw</div></div>
+        <div><div class="team-pts" style="${ptsColor}">${sc.total}</div><div class="team-pts-raw">${sc.raw} raw${liveMarker}</div></div>
       </div>`;
     }).join('');
     return `<div class="entry-card${rk===1?' rank-1':''}" onclick="this.classList.toggle('expanded')">
@@ -899,8 +946,8 @@ function renderLeaderboard(){
         <div class="rank-num ${rc}">${rk}</div>
         <div class="entry-name">${p.name}${getRankMove(p.id, rk)}</div>
         <div class="entry-score-block">
-          <div class="entry-score">${Math.round(p.score*10)/10}</div>
-          <div class="entry-score-label">pts</div>
+          <div class="entry-score">${Math.round(p.score*10)/10}${p.hasLive?'<span style="font-size:11px;color:var(--accent-hi);vertical-align:super;margin-left:2px;">●</span>':''}</div>
+          <div class="entry-score-label">${p.hasLive?'live total':'pts'}</div>
         </div>
       </div>
       <div class="team-pills">${pills||'<span style="font-size:11px;color:var(--silver-dim)">No teams</span>'}</div>
@@ -1029,6 +1076,19 @@ function logResult(){
 }
 function removeResult(id){S.r=S.r.filter(r=>r.id!==id);render();}
 function resetAll(){doneFixtures=new Set();S={p:[],t:[],r:[],seeded:false};seedData();render();}
+function forceRefresh(){
+  if(isFileProtocol()){alert('Live fetch needs the hosted GitHub Pages URL, not a local file.');return;}
+  if(!apiKey){alert('Add your API key first.');return;}
+  setSync('Force refreshing…');
+  fetchAllRecent();
+}
+function hardReset(){
+  if(!confirm('This wipes saved data and reloads everything fresh (including latest seeded results). Continue?'))return;
+  // Clear all wc26 keys
+  Object.keys(localStorage).filter(k=>k.startsWith('wc26')).forEach(k=>localStorage.removeItem(k));
+  sessionStorage.clear();
+  location.reload();
+}
 function switchTab(tab){
   ['leaderboard','teams','results','scenarios','scoring','manage'].forEach(t=>document.getElementById(`tab-${t}`).classList.toggle('hidden',t!==tab));
   document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['leaderboard','teams','results','scenarios','scoring','manage'][i]===tab));
@@ -1050,13 +1110,13 @@ const UPCOMING_MATCHES = [
 function renderScenarios(){
   const el = document.getElementById('scenarios-content');
   const ranked = [...S.p]
-    .map(p=>({...p, score:ownerScore(p.id)}))
+    .map(p=>({...p, score:ownerScore(p.id, false)}))
     .sort((a,b)=>b.score-a.score);
 
   // Helper: simulate what happens if a team wins/draws/loses
   function projectedPts(pid, extraResults){
     // extraResults: [{teamName, outcome}]
-    let total = ownerScore(pid);
+    let total = ownerScore(pid, false);
     for(const er of extraResults){
       const t = S.t.find(t=>t.pid===pid && t.name===er.teamName);
       if(t) total += Math.round(calcPts('group',er.outcome)*multiplierOf(t.rank)*10)/10;
