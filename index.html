@@ -321,7 +321,14 @@ img.emoji {
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v9 · build Jun 16</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v10 · build Jun 16 · live-aware</div>
+        <div style="margin-top:12px;">
+          <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
+            <span>API Debug Log</span>
+            <button onclick="document.getElementById('debug-log').innerHTML='';debugLines=[];" style="background:none;border:none;color:var(--silver-dim);font-size:10px;cursor:pointer;text-decoration:underline;">clear</button>
+          </div>
+          <div id="debug-log" style="font-family:monospace;font-size:9px;line-height:1.5;color:var(--silver-dim);background:rgba(0,0,0,.25);border-radius:6px;padding:8px;max-height:160px;overflow-y:auto;"></div>
+        </div>
         <div class="usage-bar-wrap" id="usage-wrap" style="display:none;">
           <div class="usage-bar-label"><span>Daily requests used</span><span id="usage-text">0 / 100</span></div>
           <div class="usage-bar"><div class="usage-bar-fill" id="usage-fill" style="width:0%"></div></div>
@@ -450,10 +457,10 @@ function findPoolTeam(apiName){
 }
 
 // ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
-let S = JSON.parse(localStorage.getItem('wc26_v9')||'null') || {p:[],t:[],r:[],seeded:false};
+let S = JSON.parse(localStorage.getItem('wc26_v10')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
-let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v9')||'[]'));
+let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v10')||'[]'));
 // Daily request counter (resets at midnight)
 let reqDay = localStorage.getItem('wc26_reqday') || '';
 let reqCount = 0;
@@ -473,8 +480,8 @@ function saveReqCount(){
 }
 
 function save(){
-  localStorage.setItem('wc26_v9', JSON.stringify(S));
-  localStorage.setItem('wc26_done_v9', JSON.stringify([...doneFixtures]));
+  localStorage.setItem('wc26_v10', JSON.stringify(S));
+  localStorage.setItem('wc26_done_v10', JSON.stringify([...doneFixtures]));
 }
 
 // ─── LIVE STATE (in-memory only) ──────────────────────────────────────────────
@@ -578,30 +585,28 @@ async function fetchFixturesForDate(date){
   return data.response;
 }
 
-// Master fetch: grabs yesterday + today, processes all finished, updates live list
+// Master fetch: grabs yesterday + today + tomorrow, processes all finished, updates live list
 async function fetchAllRecent(){
-  // Fetch yesterday and today in parallel to catch late finishers
-  const [yest, today] = await Promise.all([
+  const [yest, today, tmrw] = await Promise.all([
     fetchFixturesForDate(dateStr(-1)),
     fetchFixturesForDate(dateStr(0)),
+    fetchFixturesForDate(dateStr(1)),
   ]);
-  const all = [...yest, ...today];
-  todayFixtures = today;
+  const all = [...yest, ...today, ...tmrw];
+  todayFixtures = [...today, ...tmrw]; // include tomorrow for upcoming display
 
-  // Separate live vs finished
   const nowLive = all.filter(f => LIVE_STATUSES.has(f.fixture?.status?.short));
   const finished = all.filter(f => FT_STATUSES.has(f.fixture?.status?.short));
 
-  // Update liveFixtures global
   liveFixtures = nowLive;
+  debugLog(`Full fetch: ${all.length} fixtures · ${nowLive.length} live · ${finished.length} finished`);
+  if(nowLive.length){
+    nowLive.forEach(f=>debugLog(`  LIVE: ${f.teams?.home?.name} ${f.goals?.home}-${f.goals?.away} ${f.teams?.away?.name} (${f.fixture?.status?.short} ${f.fixture?.status?.elapsed}')`));
+  }
 
-  // Process finished → commit to pool scoring
   processFixtures(finished);
-
-  // Fetch events for live games
   for(const f of nowLive){ await fetchEvents(f.fixture.id); }
 
-  // Update UI
   if(!nowLive.length) document.getElementById('live-banner').innerHTML='';
   renderBanner();
   renderLeaderboard();
@@ -619,15 +624,23 @@ async function fetchAllRecent(){
 
 // Lightweight live-only poll (used when we know a game is in progress)
 async function fetchLiveFixtures(){
-  const data = await apiFetch(`/fixtures?live=${WC_LEAGUE}`);
-  if(!data || data._corsError || data._httpError || data._apiError) return;
-  const wcLive = (data.response||[]).filter(f => f.league?.id === WC_LEAGUE);
-  liveFixtures = wcLive;
-  processFixtures(wcLive); // catches any that just finished
-  for(const f of wcLive){ await fetchEvents(f.fixture.id); }
-  if(!wcLive.length){
+  // Use live=all then filter to WC — more reliable than live={leagueId}
+  const data = await apiFetch(`/fixtures?live=all`);
+  if(!data || data._corsError || data._httpError || data._apiError){
+    debugLog('Live fetch failed: '+JSON.stringify(data?._corsError||data?._httpError||data?._apiError||'no data'));
+    return;
+  }
+  const all = data.response||[];
+  // Filter to World Cup: league id 1 AND season 2026
+  const wcLive = all.filter(f => f.league?.id === WC_LEAGUE && String(f.league?.season)===String(WC_SEASON));
+  // Fallback: if season filter wipes everything but league matches exist, use league-only
+  const wcLiveFinal = wcLive.length ? wcLive : all.filter(f => f.league?.id === WC_LEAGUE);
+  debugLog(`Live poll: ${all.length} live total, ${wcLiveFinal.length} WC`);
+  liveFixtures = wcLiveFinal;
+  processFixtures(wcLiveFinal);
+  for(const f of wcLiveFinal){ await fetchEvents(f.fixture.id); }
+  if(!wcLiveFinal.length){
     document.getElementById('live-banner').innerHTML='';
-    // Game just ended — do a full fetch to catch the FT result
     await fetchAllRecent();
     return;
   }
@@ -636,7 +649,7 @@ async function fetchLiveFixtures(){
   renderLeaderboard();
   renderTeams();
   renderResults();
-  setSync(`🔴 ${wcLive.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
+  setSync(`🔴 ${wcLiveFinal.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
 }
 
 // Fetch events (goals, cards) for a fixture and cache them
@@ -707,38 +720,64 @@ function detectPhase(round){
 let pollTimer = null;
 let isMatchDay = false;
 
+// Polling cadence (tunable):
+//   • Live game in progress → poll every 6 min (covers four 90-min games on the free tier)
+//   • A kickoff is imminent (within 10 min) → poll every 6 min to catch the start
+//   • Otherwise idle → poll every 15 min just to pick up final results
+const POLL_BASE_MS = 60000;            // base tick = 1 min
+const LIVE_EVERY_TICKS = 6;            // 6 min when live
+const IDLE_EVERY_TICKS = 15;           // 15 min when nothing live
+
 function startPolling(){
   if(pollTimer) clearInterval(pollTimer);
   if(!apiKey){ setSync('Add your API key in Manage → Live API Setup'); return; }
   setSync('Fetching latest scores…');
-  // Initial load: fetch yesterday + today to catch any missed results
   fetchAllRecent();
   let tick = 0;
   pollTimer = setInterval(()=>{
     tick++;
-    if(liveFixtures.length > 0){
-      // Live match in progress — poll every 60s for score + events
-      fetchLiveFixtures();
-    } else if(shouldCheckForLive() || tick % 5 === 0){
-      // Near a kickoff time OR every 5 min — full fetch
-      fetchAllRecent();
+    const liveActive = liveFixtures.length > 0;
+    const kickoffSoon = shouldCheckForLive();
+    if(liveActive || kickoffSoon){
+      // Active window — poll every 6 min
+      if(tick % LIVE_EVERY_TICKS === 0 || (kickoffSoon && !liveActive)){
+        debugLog(`Poll tick ${tick}: live/kickoff window → fetching`);
+        if(liveActive) fetchLiveFixtures(); else fetchAllRecent();
+      }
+    } else {
+      // Idle — poll every 15 min
+      if(tick % IDLE_EVERY_TICKS === 0){
+        debugLog(`Poll tick ${tick}: idle → light fetch`);
+        fetchAllRecent();
+      }
     }
-  }, 60000);
+  }, POLL_BASE_MS);
 }
 
-// Returns true if any today fixture has a kickoff within the next 10 min or started <130min ago
+// Returns true if any fixture kicks off within 10 min or started <130min ago and isn't finished
 function shouldCheckForLive(){
   const nowMs = Date.now();
   for(const f of todayFixtures){
     if(FT_STATUSES.has(f.fixture?.status?.short)) continue;
     const ko = new Date(f.fixture.date).getTime();
     const delta = nowMs - ko;
-    if(delta >= -600000 && delta < 130*60000) return true; // within 10min before or 130min after KO
+    if(delta >= -600000 && delta < 130*60000) return true;
   }
   return false;
 }
 
 function setSync(msg){ const el=document.getElementById('sync-label'); if(el) el.textContent=msg; }
+
+// Debug log — visible in Manage tab so you can see what the API returns
+let debugLines = [];
+function debugLog(msg){
+  const ts = new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  debugLines.unshift(`[${ts}] ${msg}`);
+  debugLines = debugLines.slice(0,25);
+  const el = document.getElementById('debug-log');
+  if(el) el.innerHTML = debugLines.map(l=>`<div>${l}</div>`).join('');
+  console.log('[WC26]', msg);
+}
 
 function saveKey(){
   const val = document.getElementById('api-key-input').value.trim();
@@ -794,23 +833,33 @@ function saveKey(){
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
-// Store previous rank snapshot (persisted per session)
-let prevRanks = JSON.parse(sessionStorage.getItem('wc26_prevranks_v9')||'null');
-function snapshotRanks(ranked){
-  // Only update snapshot once per session on first render
-  if(!prevRanks){
-    prevRanks = {};
-    ranked.forEach((p,i)=>{ prevRanks[p.id]=i+1; });
-    sessionStorage.setItem('wc26_prevranks_v9', JSON.stringify(prevRanks));
+// ─── DAILY RANK MOVEMENT ──────────────────────────────────────────────────────
+// Stores a snapshot of standings taken at the START of each calendar day.
+// Movement (▲/▼) compares the CURRENT live standings against that morning snapshot,
+// so it reflects everything that happened across all of today's games and resets daily.
+let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v10')||'null');
+// dailySnap = { date:'YYYY-MM-DD', ranks:{pid:rank} }
+
+function maybeRollDailySnapshot(rankedConfirmed){
+  const today = dateStr(0);
+  if(!dailySnap || dailySnap.date !== today){
+    // New day (or first ever) — capture this morning's standings as the baseline.
+    // Use CONFIRMED scores (no live) so the baseline is stable.
+    const ranks = {};
+    rankedConfirmed.forEach((p,i)=>ranks[p.id]=i+1);
+    dailySnap = { date: today, ranks };
+    localStorage.setItem('wc26_dailysnap_v10', JSON.stringify(dailySnap));
+    debugLog(`New daily snapshot captured for ${today}`);
   }
 }
+
 function getRankMove(pid, currentRank){
-  if(!prevRanks||prevRanks[pid]==null) return '';
-  const prev = prevRanks[pid];
-  const diff = prev - currentRank; // positive = moved up
-  if(diff===0) return '<span style="font-size:10px;color:var(--silver-dim);margin-left:4px;">–</span>';
-  if(diff>0) return '<span style="font-size:10px;color:var(--win);margin-left:4px;">▲'+diff+'</span>';
-  return '<span style="font-size:10px;color:var(--loss);margin-left:4px;">▼'+Math.abs(diff)+'</span>';
+  if(!dailySnap || dailySnap.ranks[pid]==null) return '';
+  const prev = dailySnap.ranks[pid];
+  const diff = prev - currentRank; // positive = moved up since this morning
+  if(diff===0) return '<span style="font-size:10px;color:var(--silver-dim);margin-left:5px;" title="No change today">–</span>';
+  if(diff>0) return '<span style="font-size:10px;color:var(--win);margin-left:5px;font-weight:700;" title="Up '+diff+' since this morning">▲'+diff+'</span>';
+  return '<span style="font-size:10px;color:var(--loss);margin-left:5px;font-weight:700;" title="Down '+Math.abs(diff)+' since this morning">▼'+Math.abs(diff)+'</span>';
 }
 
 function render(){
@@ -882,6 +931,13 @@ function renderBanner(){
 // ─── LEADERBOARD ──────────────────────────────────────────────────────────────
 function renderLeaderboard(){
   document.getElementById('match-meta').textContent = `${doneFixtures.size} matches logged`;
+  // Confirmed standings (no live) — used for the daily baseline snapshot
+  const rankedConfirmed = [...S.p]
+    .map(p=>({...p, cscore:ownerScore(p.id,false)}))
+    .sort((a,b)=>b.cscore-a.cscore);
+  maybeRollDailySnapshot(rankedConfirmed);
+
+  // Live standings (includes provisional in-progress points) — what we display
   const ranked = [...S.p]
     .map(p=>{
       const teams = S.t.filter(t=>t.pid===p.id);
@@ -889,7 +945,6 @@ function renderLeaderboard(){
       return {...p, score:ownerScore(p.id), teams, hasLive};
     })
     .sort((a,b)=>b.score-a.score);
-  snapshotRanks(ranked);
 
   document.getElementById('leaderboard-list').innerHTML = ranked.map((p,i)=>{
     const rk=i+1, rc=rk===1?'r1':rk===2?'r2':rk===3?'r3':'';
