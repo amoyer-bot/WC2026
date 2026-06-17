@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WC26 Pool · Live</title>
+<script src="https://cdn.jsdelivr.net/npm/twemoji@14.0.2/dist/twemoji.min.js" crossorigin="anonymous"></script>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
@@ -181,6 +182,17 @@ header{display:flex;align-items:center;justify-content:space-between;padding:24p
 .empty-icon{font-size:30px;margin-bottom:8px;}
 ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:10px;}
 @media(max-width:500px){.entry-score{font-size:22px;}.team-pills,.entry-detail{margin-left:0;}.lm-score{font-size:36px;}}
+
+/* Twemoji — renders flag emoji as SVG images on all platforms */
+img.emoji {
+  height: 1.1em;
+  width: 1.1em;
+  vertical-align: -0.15em;
+  display: inline-block;
+  border-radius: 2px;
+}
+.lm-flag img.emoji { height: 1.4em; width: 1.4em; }
+.tr-flag img.emoji { height: 1.1em; width: 1.1em; }
 </style>
 </head>
 <body>
@@ -503,6 +515,7 @@ async function fetchLiveFixtures(){
   // If no live matches, clear banner
   if(!wcLive.length) document.getElementById('live-banner').innerHTML = '';
   renderBanner();
+  if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
   renderLeaderboard();
   renderTeams();
   renderResults();
@@ -651,7 +664,11 @@ function saveKey(){
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
-function render(){ renderLeaderboard(); renderTeams(); renderResults(); renderManage(); save(); }
+function render(){
+  renderLeaderboard(); renderTeams(); renderResults(); renderManage(); save();
+  // Re-parse emoji after DOM update
+  if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+}
 
 // ─── LIVE BANNER ──────────────────────────────────────────────────────────────
 function renderBanner(){
