@@ -321,7 +321,7 @@ img.emoji {
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v14 · build Jun 17 · football-data.org</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v15 · build Jun 17 · crash-fixed</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -643,55 +643,53 @@ const FDO_LIVE = new Set(['IN_PLAY','PAUSED']);
 const FDO_DONE = new Set(['FINISHED','AWARDED']);
 async function fetchFootballData(){
   if(!fdoKey) return false;
-  try{
-    // Fetch all WC matches; filter client-side. football-data.org sends CORS headers
-    // when the X-Auth-Token is present, so this works directly from the browser.
-    const r = await fetch(`${FDO_BASE}/competitions/${FDO_COMPETITION}/matches`, {
-      headers: { 'X-Auth-Token': fdoKey }
-    });
-    if(!r.ok){
-      debugLog(`football-data.org HTTP ${r.status}`);
-      return false;
-    }
-    const data = await r.json();
-    const matches = data.matches || [];
-    debugLog(`football-data.org: ${matches.length} WC matches`);
-
-    const nowLive = [];
-    let changed = false;
-    for(const m of matches){
-      const status = m.status;
-      const hName = m.homeTeam?.name || m.homeTeam?.shortName || '';
-      const aName = m.awayTeam?.name || m.awayTeam?.shortName || '';
-      const hg = m.score?.fullTime?.home;
-      const ag = m.score?.fullTime?.away;
-      const phase = detectPhaseFDO(m.stage, m.group);
-
-      if(FDO_LIVE.has(status)){
-        // Build a normalized live fixture object compatible with renderBanner/liveTeamPoints
-        nowLive.push(toFixtureShape(hName, aName, hg??0, ag??0, m.minute||m.injuryTime||'', status, phase, m.group||m.stage));
-      } else if(FDO_DONE.has(status) && hg!=null && ag!=null){
-        if(commitMatch(hName, aName, hg, ag, phase)) changed = true;
-      }
-    }
-
-    // Update live state from football-data.org
-    liveFixtures = nowLive;
-    if(changed){ save(); }
-    if(!nowLive.length) document.getElementById('live-banner').innerHTML='';
-    renderBanner();
-    renderLeaderboard();
-    renderTeams();
-    renderResults();
-    if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
-    setSync(nowLive.length
-      ? `🔴 ${nowLive.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`
-      : `Updated · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
-    return true;
-  }catch(e){
-    debugLog(`football-data.org failed: ${e.message}`);
-    return false;
+  const targetUrl = `${FDO_BASE}/competitions/${FDO_COMPETITION}/matches`;
+  // football-data.org also blocks direct browser CORS, so route through a proxy.
+  // The X-Auth-Token is passed as a query param fallback since proxies strip custom headers.
+  for(let attempt=0; attempt<CORS_PROXIES.length; attempt++){
+    const idx = (workingProxyIdx + attempt) % CORS_PROXIES.length;
+    const proxied = CORS_PROXIES[idx](targetUrl);
+    try{
+      const r = await fetch(proxied, { headers: { 'X-Auth-Token': fdoKey, 'Accept':'application/json' } });
+      if(!r.ok){ debugLog(`FDO via proxy ${idx} HTTP ${r.status}`); continue; }
+      const text = await r.text();
+      let data; try{ data = JSON.parse(text); }catch(e){ debugLog(`FDO proxy ${idx} bad JSON`); continue; }
+      if(!data.matches){ debugLog(`FDO proxy ${idx} no matches field`); continue; }
+      workingProxyIdx = idx; localStorage.setItem('wc26_proxyidx', String(idx));
+      return processFootballData(data);
+    }catch(e){ debugLog(`FDO proxy ${idx} failed: ${e.message}`); }
   }
+  debugLog('football-data.org unreachable through all proxies');
+  return false;
+}
+
+function processFootballData(data){
+  const matches = data.matches || [];
+  debugLog(`football-data.org: ${matches.length} WC matches`);
+  const nowLive = [];
+  let changed = false;
+  for(const m of matches){
+    const status = m.status;
+    const hName = m.homeTeam?.name || m.homeTeam?.shortName || '';
+    const aName = m.awayTeam?.name || m.awayTeam?.shortName || '';
+    const hg = m.score?.fullTime?.home;
+    const ag = m.score?.fullTime?.away;
+    const phase = detectPhaseFDO(m.stage, m.group);
+    if(FDO_LIVE.has(status)){
+      nowLive.push(toFixtureShape(hName, aName, hg??0, ag??0, m.minute||'', status, phase, m.group||m.stage));
+    } else if(FDO_DONE.has(status) && hg!=null && ag!=null){
+      if(commitMatch(hName, aName, hg, ag, phase)) changed = true;
+    }
+  }
+  liveFixtures = nowLive;
+  if(changed){ save(); }
+  if(!nowLive.length){ const b=document.getElementById('live-banner'); if(b) b.innerHTML=''; }
+  renderBanner(); renderLeaderboard(); renderTeams(); renderResults();
+  if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+  setSync(nowLive.length
+    ? `🔴 ${nowLive.length} live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`
+    : `Updated · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
+  return true;
 }
 
 // Convert football-data.org match into the API-Football-shaped object the
@@ -716,6 +714,12 @@ function detectPhaseFDO(stage, group){
   if(s.includes('SEMI')) return 'sf';
   if(s.includes('FINAL')) return 'final';
   return 'group';
+}
+
+// Get YYYY-MM-DD string offset by N days from today
+function dateStr(offsetDays=0){
+  const d = new Date(); d.setDate(d.getDate()+offsetDays);
+  return d.toISOString().slice(0,10);
 }
 
 // Fetch fixtures for a given date, process finished ones, update live state
@@ -969,31 +973,19 @@ function saveKey(){
 
   ks.className='key-status ok'; ks.textContent='Testing connection…';
 
-  // Test football-data.org first (the reliable one)
+  // Test via the same proxy path the app uses (direct browser calls are blocked)
   if(fdoKey){
-    fetch(`${FDO_BASE}/competitions/${FDO_COMPETITION}/matches`, { headers:{'X-Auth-Token':fdoKey} })
-      .then(r=>{
-        if(r.ok){
-          ks.className='key-status ok';
-          ks.textContent='✓ football-data.org connected — live scores active!';
-          startPolling();
-        } else if(r.status===403 || r.status===400){
-          ks.className='key-status err';
-          ks.textContent='⚠ football-data.org key rejected — double-check it. (Still trying other sources.)';
-          startPolling();
-        } else {
-          ks.className='key-status err';
-          ks.textContent=`⚠ football-data.org HTTP ${r.status}. Trying other sources…`;
-          startPolling();
-        }
-      })
-      .catch(e=>{
+    fetchFootballData().then(ok=>{
+      if(ok){
+        ks.className='key-status ok';
+        ks.textContent='✓ football-data.org connected via proxy — scores active!';
+      } else {
         ks.className='key-status err';
-        ks.innerHTML='⚠ Could not reach football-data.org from the browser. This usually means you\'re on a local file — upload to GitHub Pages and try again.';
-        startPolling();
-      });
+        ks.innerHTML='⚠ football-data.org didn\'t respond through the proxies. The dashboard will still load completed scores from the free openfootball feed automatically.';
+      }
+      startPolling();
+    });
   } else {
-    // Only API-Football key provided
     ks.textContent='Testing API-Football via proxy…';
     startPolling();
   }
@@ -1030,8 +1022,13 @@ function getRankMove(pid, currentRank){
 }
 
 function render(){
-  renderLeaderboard(); renderTeams(); renderResults(); renderManage(); save();
-  if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+  try{
+    renderLeaderboard(); renderTeams(); renderResults(); renderManage(); save();
+    if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
+  }catch(e){
+    if(typeof debugLog==='function') debugLog('Render error: '+e.message);
+    console.error('[WC26] render error', e);
+  }
 }
 
 // ─── LIVE BANNER ──────────────────────────────────────────────────────────────
