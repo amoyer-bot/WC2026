@@ -321,7 +321,7 @@ img.emoji {
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v11 · build Jun 17 · CORS-proxied</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v12 · build Jun 17 · dedup-fixed</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -470,10 +470,10 @@ function findPoolTeam(apiName){
 }
 
 // ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
-let S = JSON.parse(localStorage.getItem('wc26_v11')||'null') || {p:[],t:[],r:[],seeded:false};
+let S = JSON.parse(localStorage.getItem('wc26_v12')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
-let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v11')||'[]'));
+let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v12')||'[]'));
 // Daily request counter (resets at midnight)
 let reqDay = localStorage.getItem('wc26_reqday') || '';
 let reqCount = 0;
@@ -493,8 +493,8 @@ function saveReqCount(){
 }
 
 function save(){
-  localStorage.setItem('wc26_v11', JSON.stringify(S));
-  localStorage.setItem('wc26_done_v11', JSON.stringify([...doneFixtures]));
+  localStorage.setItem('wc26_v12', JSON.stringify(S));
+  localStorage.setItem('wc26_done_v12', JSON.stringify([...doneFixtures]));
 }
 
 // ─── LIVE STATE (in-memory only) ──────────────────────────────────────────────
@@ -604,7 +604,6 @@ async function apiFetch(endpoint, skipCount=false){
 }
 
 // ─── OPENFOOTBALL FALLBACK (keyless, public domain, CORS-enabled) ─────────────
-// Used when API-Football proxies all fail. Provides completed + scheduled scores.
 async function fetchOpenFootball(){
   for(const url of OPENFOOTBALL_URLS){
     try{
@@ -614,20 +613,11 @@ async function fetchOpenFootball(){
       const matches = data.matches || [];
       debugLog(`openfootball: ${matches.length} matches loaded`);
       let changed = false;
-      const now = Date.now();
       for(const m of matches){
         if(!m.score || !m.score.ft) continue; // not finished
-        const key = 'of_'+(m.team1||'')+'_'+(m.team2||'')+'_'+(m.date||'');
-        if(doneFixtures.has(key)) continue;
         const [hg, ag] = m.score.ft;
-        const t1 = findPoolTeam(m.team1), t2 = findPoolTeam(m.team2);
-        const phase = detectPhase(m.round||m.group||'');
-        const o1 = hg>ag?'win':hg===ag?'draw':'loss';
-        const o2 = ag>hg?'win':hg===ag?'draw':'loss';
-        if(t1){ S.r.push({id:uid(),tid:t1.id,phase,outcome:o1,pts:calcPts(phase,o1),ts:now,auto:true,fid:key,scoreline:`${hg}–${ag} vs ${normName(m.team2)}`}); }
-        if(t2){ S.r.push({id:uid(),tid:t2.id,phase,outcome:o2,pts:calcPts(phase,o2),ts:now,auto:true,fid:key,scoreline:`${ag}–${hg} vs ${normName(m.team1)}`}); }
-        doneFixtures.add(key);
-        if(t1||t2) changed = true;
+        const phase = detectPhase(m.round || m.group || '');
+        if(commitMatch(m.team1, m.team2, hg, ag, phase)) changed = true;
       }
       if(changed){ save(); render(); }
       return true;
@@ -734,50 +724,55 @@ async function fetchEvents(fixtureId){
   if(data?.response && !data._corsError) eventCache[fixtureId] = data.response;
 }
 
-// Process a list of fixtures — commit finished ones to pool results
+// Cache of actual scores {h|a -> {hg,ag}}
+const matchScoreCache = {};
+
+// Canonical match key: two NORMALISED team names (sorted) + phase.
+// Source-independent, so seed / openfootball / API all collapse to one key.
+function matchKey(name1, name2, phase){
+  const a = normName(name1), b = normName(name2);
+  const pair = [a,b].sort().join('__');
+  return `M_${pair}_${phase}`;
+}
+
+// Commit a single finished match to pool results, guarded by canonical key.
+// Returns true if anything was newly added.
+function commitMatch(hName, aName, hGoals, aGoals, phase){
+  const key = matchKey(hName, aName, phase);
+  if(doneFixtures.has(key)) return false; // already logged by ANY source
+  const hTeam = findPoolTeam(hName);
+  const aTeam = findPoolTeam(aName);
+  const now = Date.now();
+
+  // cache scoreline for display
+  matchScoreCache[normName(hName)+'|'+normName(aName)] = {h:normName(hName),a:normName(aName),hg:hGoals,ag:aGoals};
+
+  const hOut = hGoals>aGoals?'win':hGoals===aGoals?'draw':'loss';
+  const aOut = aGoals>hGoals?'win':hGoals===aGoals?'draw':'loss';
+
+  if(hTeam) S.r.push({id:uid(),tid:hTeam.id,phase,outcome:hOut,pts:calcPts(phase,hOut),ts:now,auto:true,mkey:key,scoreline:`${hGoals}–${aGoals} vs ${normName(aName)}`});
+  if(aTeam) S.r.push({id:uid(),tid:aTeam.id,phase,outcome:aOut,pts:calcPts(phase,aOut),ts:now,auto:true,mkey:key,scoreline:`${aGoals}–${hGoals} vs ${normName(hName)}`});
+
+  doneFixtures.add(key);
+  debugLog(`Committed: ${normName(hName)} ${hGoals}-${aGoals} ${normName(aName)} [${phase}]${hTeam||aTeam?'':' (neither in pool)'}`);
+  return !!(hTeam||aTeam);
+}
+
+// Process a list of API fixtures — commit finished ones via canonical key
 function processFixtures(fixtures){
   let changed = false;
-  const now = Date.now();
   for(const f of fixtures){
-    const fid = String(f.fixture.id);
     const status = f.fixture?.status?.short;
-    if(!status || !FT_STATUSES.has(status)) continue; // not finished
-    if(doneFixtures.has(fid)) continue;                // already logged
-
-    const hGoals = f.goals?.home ?? 0;
-    const aGoals = f.goals?.away ?? 0;
+    if(!status || !FT_STATUSES.has(status)) continue;
     const hName = f.teams?.home?.name || '';
     const aName = f.teams?.away?.name || '';
-    const hTeam = findPoolTeam(hName);
-    const aTeam = findPoolTeam(aName);
-
-    // Store match scoreline for display in leaderboard breakdown
-    const scoreKey = normName(hName)+'|'+normName(aName);
-    matchScoreCache[scoreKey] = {h:normName(hName),a:normName(aName),hg:hGoals,ag:aGoals};
-
-    const hOut = hGoals > aGoals ? 'win' : hGoals === aGoals ? 'draw' : 'loss';
-    const aOut = aGoals > hGoals ? 'win' : hGoals === aGoals ? 'draw' : 'loss';
+    const hGoals = f.goals?.home ?? 0;
+    const aGoals = f.goals?.away ?? 0;
     const phase = detectPhase(f.league?.round || '');
-
-    console.log(`[WC26] Processing: ${hName} ${hGoals}-${aGoals} ${aName} | phase:${phase} | hTeam:${hTeam?.name||'none'} aTeam:${aTeam?.name||'none'}`);
-
-    if(hTeam){
-      S.r.push({id:uid(),tid:hTeam.id,phase,outcome:hOut,pts:calcPts(phase,hOut),ts:now,auto:true,fid,
-        scoreline:`${hGoals}–${aGoals} vs ${normName(aName)}`});
-    }
-    if(aTeam){
-      S.r.push({id:uid(),tid:aTeam.id,phase,outcome:aOut,pts:calcPts(phase,aOut),ts:now,auto:true,fid,
-        scoreline:`${aGoals}–${hGoals} vs ${normName(hName)}`});
-    }
-    doneFixtures.add(fid);
-    if(hTeam||aTeam) changed = true;
-    else changed = true; // still mark done so we don't recheck
+    if(commitMatch(hName, aName, hGoals, aGoals, phase)) changed = true;
   }
   if(changed){ save(); render(); }
 }
-
-// Cache of actual scores from API {h|a -> {hg,ag}}
-const matchScoreCache = {};
 
 function detectPhase(round){
   if(!round) return 'group';
@@ -914,7 +909,7 @@ function saveKey(){
 // Stores a snapshot of standings taken at the START of each calendar day.
 // Movement (▲/▼) compares the CURRENT live standings against that morning snapshot,
 // so it reflects everything that happened across all of today's games and resets daily.
-let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v11')||'null');
+let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v12')||'null');
 // dailySnap = { date:'YYYY-MM-DD', ranks:{pid:rank} }
 
 function maybeRollDailySnapshot(rankedConfirmed){
@@ -925,7 +920,7 @@ function maybeRollDailySnapshot(rankedConfirmed){
     const ranks = {};
     rankedConfirmed.forEach((p,i)=>ranks[p.id]=i+1);
     dailySnap = { date: today, ranks };
-    localStorage.setItem('wc26_dailysnap_v11', JSON.stringify(dailySnap));
+    localStorage.setItem('wc26_dailysnap_v12', JSON.stringify(dailySnap));
     debugLog(`New daily snapshot captured for ${today}`);
   }
 }
@@ -1447,6 +1442,8 @@ const MATCH_RESULTS_BY_TEAM = (()=>{
   add('Iran',2,2,'New Zealand','G','Jun 15');
   add('France',3,1,'Senegal','I','Jun 16');
   add('Norway',4,1,'Iraq','I','Jun 16');
+  add('Argentina',3,0,'Algeria','J','Jun 16');
+  add('Austria',3,1,'Jordan','J','Jun 16');
   // Jun 15 (seeded but needed for chip display on older results)
   add('Belgium',1,1,'Egypt','G','Jun 15');
   add('Saudi Arabia',1,1,'Uruguay','H','Jun 15');
@@ -1473,8 +1470,8 @@ const SEED_MATCHES=[
   {g:'G',d:'Jun 15',hf:'🇮🇷',h:'Iran',         score:'2–2',af:'🇳🇿',a:'New Zealand'},
   {g:'I',d:'Jun 16',hf:'🇫🇷',h:'France',       score:'3–1',af:'🇸🇳',a:'Senegal'},
   {g:'I',d:'Jun 16',hf:'🇮🇶',h:'Iraq',         score:'1–4',af:'🇳🇴',a:'Norway'},
-  {g:'J',d:'Jun 16',hf:'🇦🇷',h:'Argentina',    score:null, af:'🇩🇿',a:'Algeria'},
-  {g:'J',d:'Jun 16',hf:'🇦🇹',h:'Austria',      score:null, af:'🇯🇴',a:'Jordan'},
+  {g:'J',d:'Jun 16',hf:'🇦🇷',h:'Argentina',    score:'3–0', af:'🇩🇿',a:'Algeria'},
+  {g:'J',d:'Jun 16',hf:'🇦🇹',h:'Austria',      score:'3–1', af:'🇯🇴',a:'Jordan'},
 ];
 
 // ─── SEED POOL DATA ───────────────────────────────────────────────────────────
@@ -1500,38 +1497,58 @@ function seedData(){
     entry.teams.forEach(t=>S.t.push({id:uid(),pid,...t}));
   });
   // Seed known results through Jun 15 (these get a special seed key so API won't double-log)
-  const byName=n=>S.t.find(t=>t.name.toLowerCase()===n.toLowerCase());
-  const add=(name,phase,outcome,seedKey)=>{
-    const team=byName(name); if(!team) return;
-    if(doneFixtures.has(seedKey)) return;
-    S.r.push({id:uid(),tid:team.id,phase,outcome,pts:calcPts(phase,outcome),ts:Date.now(),auto:true});
-    doneFixtures.add(seedKey);
-  };
-  add('Mexico','group','win','seed_MexicoSouthAfrica_h');       add('South Africa','group','loss','seed_MexicoSouthAfrica_a');
-  add('South Korea','group','win','seed_SouthKoreaCzech_h');    add('Czech Republic','group','loss','seed_SouthKoreaCzech_a');
-  add('Canada','group','draw','seed_CanadaBosnia_h');           add('Bosnia','group','draw','seed_CanadaBosnia_a');
-  add('Qatar','group','draw','seed_QatarSwitzerland_h');        add('Switzerland','group','draw','seed_QatarSwitzerland_a');
-  add('Brazil','group','draw','seed_BrazilMorocco_h');          add('Morocco','group','draw','seed_BrazilMorocco_a');
-  add('Scotland','group','win','seed_ScotlandHaiti_h');         add('Haiti','group','loss','seed_ScotlandHaiti_a');
-  add('USA','group','win','seed_USAParaguay_h');                add('Paraguay','group','loss','seed_USAParaguay_a');
-  add('Australia','group','win','seed_AustraliaTurkey_h');      add('Turkey','group','loss','seed_AustraliaTurkey_a');
-  add('Germany','group','win','seed_GermanyCuracao_h');         add('Curaçao','group','loss','seed_GermanyCuracao_a');
-  add('Ivory Coast','group','win','seed_IvoryCoastEcuador_h');  add('Ecuador','group','loss','seed_IvoryCoastEcuador_a');
-  add('Netherlands','group','draw','seed_NetherlandsJapan_h');  add('Japan','group','draw','seed_NetherlandsJapan_a');
-  add('Sweden','group','win','seed_SwedenTunisia_h');           add('Tunisia','group','loss','seed_SwedenTunisia_a');
-  add('Spain','group','draw','seed_SpainCapeVerde_h');          add('Cape Verde','group','draw','seed_SpainCapeVerde_a');
+  // Seed completed results using canonical commitMatch so they dedupe with API/openfootball
+  const seedMatch=(h,hg,ag,a)=>{ commitMatch(h, a, hg, ag, 'group'); };
+  // Jun 11–14
+  seedMatch('Mexico',2,0,'South Africa');
+  seedMatch('South Korea',2,1,'Czech Republic');
+  seedMatch('Canada',1,1,'Bosnia');
+  seedMatch('Switzerland',1,1,'Qatar');
+  seedMatch('Brazil',1,1,'Morocco');
+  seedMatch('Scotland',1,0,'Haiti');
+  seedMatch('USA',4,1,'Paraguay');
+  seedMatch('Australia',2,0,'Turkey');
+  seedMatch('Germany',7,1,'Curaçao');
+  seedMatch('Ivory Coast',1,0,'Ecuador');
+  seedMatch('Netherlands',2,2,'Japan');
+  seedMatch('Sweden',5,1,'Tunisia');
   // Jun 15
-  add('Belgium','group','draw','seed_BelgiumEgypt_h');          add('Egypt','group','draw','seed_BelgiumEgypt_a');
-  add('Saudi Arabia','group','draw','seed_SaudiUruguay_h');     add('Uruguay','group','draw','seed_SaudiUruguay_a');
-  add('Iran','group','draw','seed_IranNZ_h');                   add('New Zealand','group','draw','seed_IranNZ_a');
-  // Jun 16 (completed)
-  add('France','group','win','seed_FranceSenegal_h');           add('Senegal','group','loss','seed_FranceSenegal_a');
-  add('Norway','group','win','seed_NorwayIraq_h');              add('Iraq','group','loss','seed_NorwayIraq_a');
+  seedMatch('Spain',0,0,'Cape Verde');
+  seedMatch('Belgium',1,1,'Egypt');
+  seedMatch('Saudi Arabia',1,1,'Uruguay');
+  seedMatch('Iran',2,2,'New Zealand');
+  // Jun 16
+  seedMatch('France',3,1,'Senegal');
+  seedMatch('Norway',4,1,'Iraq');
+  seedMatch('Argentina',3,0,'Algeria');
+  seedMatch('Austria',3,1,'Jordan');
   S.seeded=true; save();
+}
+
+// ─── ONE-TIME DEDUP REPAIR ────────────────────────────────────────────────────
+// Collapses duplicate results (same team+phase+outcome+scoreline) that may have
+// been double-logged by earlier versions. Keeps the first of each.
+function repairDuplicates(){
+  const seen = new Set();
+  const cleaned = [];
+  for(const r of S.r){
+    // identity = team + phase + scoreline (or outcome if no scoreline)
+    const id = `${r.tid}|${r.phase}|${r.scoreline||r.outcome}`;
+    if(seen.has(id)) continue;
+    seen.add(id);
+    cleaned.push(r);
+  }
+  if(cleaned.length !== S.r.length){
+    debugLog(`Repaired ${S.r.length - cleaned.length} duplicate result(s)`);
+    S.r = cleaned;
+    // Rebuild doneFixtures from cleaned results so future fetches dedup correctly
+    save();
+  }
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 seedData();
+repairDuplicates();
 render();
 saveReqCount();
 if(isFileProtocol()){
