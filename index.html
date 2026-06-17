@@ -137,6 +137,21 @@ header{display:flex;align-items:center;justify-content:space-between;padding:24p
 .scoring-card{background:var(--bg-card);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:14px 16px;}
 .scoring-card h3{font-family:'Oswald',sans-serif;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:10px;}
 .score-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04);color:var(--silver-dim);}
+/* SCENARIOS */
+.scenario-section{margin-bottom:20px;}
+.scenario-section h3{font-family:'Oswald',sans-serif;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:10px;}
+.scenario-card{background:var(--bg-card);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:13px 15px;margin-bottom:8px;}
+.scenario-card.hot{border-color:rgba(240,192,64,.3);background:linear-gradient(135deg,rgba(240,192,64,.05),var(--bg-card));}
+.scenario-card.danger{border-color:rgba(232,112,106,.25);}
+.scenario-match{font-size:12px;font-weight:600;color:var(--silver);margin-bottom:6px;display:flex;align-items:center;gap:8px;}
+.scenario-match-badge{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;background:rgba(58,111,212,.15);color:var(--blue);padding:2px 7px;border-radius:4px;}
+.scenario-items{display:flex;flex-direction:column;gap:5px;}
+.scenario-item{font-size:11px;color:var(--silver-dim);display:flex;align-items:flex-start;gap:7px;line-height:1.5;}
+.scenario-icon{flex-shrink:0;font-size:12px;}
+.scenario-item strong{color:var(--silver);}
+.scenario-item .pts-change{font-family:'Oswald',sans-serif;font-size:13px;font-weight:700;}
+.pts-up{color:var(--win)}.pts-dn{color:var(--loss)}.pts-neu{color:var(--silver-dim)}
+.scenario-no-games{text-align:center;padding:40px;color:var(--silver-dim);font-size:13px;}
 .score-row:last-child{border-bottom:none;}
 .score-row .pts{font-family:'Oswald',sans-serif;font-size:14px;font-weight:700;color:var(--silver);}
 .mult-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px;color:var(--silver-dim);}
@@ -221,6 +236,7 @@ img.emoji {
   <button class="tab active" onclick="switchTab('leaderboard')">Leaderboard</button>
   <button class="tab" onclick="switchTab('teams')">Teams</button>
   <button class="tab" onclick="switchTab('results')">Results</button>
+  <button class="tab" onclick="switchTab('scenarios')">Scenarios ✨</button>
   <button class="tab" onclick="switchTab('scoring')">Rules</button>
   <button class="tab" onclick="switchTab('manage')">Manage</button>
 </div>
@@ -241,6 +257,12 @@ img.emoji {
 <div id="tab-results" class="hidden">
   <div class="section-label">Match Results</div>
   <div class="results-grid" id="results-display"></div>
+</div>
+
+<!-- SCENARIOS -->
+<div id="tab-scenarios" class="hidden">
+  <div class="section-label">Scenario Analysis ✨</div>
+  <div id="scenarios-content"></div>
 </div>
 
 <!-- SCORING -->
@@ -664,9 +686,27 @@ function saveKey(){
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
+// Store previous rank snapshot (persisted per session)
+let prevRanks = JSON.parse(sessionStorage.getItem('wc26_prevranks')||'null');
+function snapshotRanks(ranked){
+  // Only update snapshot once per session on first render
+  if(!prevRanks){
+    prevRanks = {};
+    ranked.forEach((p,i)=>{ prevRanks[p.id]=i+1; });
+    sessionStorage.setItem('wc26_prevranks', JSON.stringify(prevRanks));
+  }
+}
+function getRankMove(pid, currentRank){
+  if(!prevRanks||prevRanks[pid]==null) return '';
+  const prev = prevRanks[pid];
+  const diff = prev - currentRank; // positive = moved up
+  if(diff===0) return '<span style="font-size:10px;color:var(--silver-dim);margin-left:4px;">–</span>';
+  if(diff>0) return '<span style="font-size:10px;color:var(--win);margin-left:4px;">▲'+diff+'</span>';
+  return '<span style="font-size:10px;color:var(--loss);margin-left:4px;">▼'+Math.abs(diff)+'</span>';
+}
+
 function render(){
   renderLeaderboard(); renderTeams(); renderResults(); renderManage(); save();
-  // Re-parse emoji after DOM update
   if(window.twemoji) twemoji.parse(document.body, {folder:'svg', ext:'.svg'});
 }
 
@@ -737,6 +777,7 @@ function renderLeaderboard(){
   const ranked = [...S.p]
     .map(p=>({...p, score:ownerScore(p.id), teams:S.t.filter(t=>t.pid===p.id)}))
     .sort((a,b)=>b.score-a.score);
+  snapshotRanks(ranked);
 
   document.getElementById('leaderboard-list').innerHTML = ranked.map((p,i)=>{
     const rk=i+1, rc=rk===1?'r1':rk===2?'r2':rk===3?'r3':'';
@@ -758,8 +799,19 @@ function renderLeaderboard(){
         const min = lf.fixture.status.short==='HT'?'HT':lf.fixture.status.elapsed+"'";
         liveChip = `<span class="chip chip-live">LIVE ${min} · ${stat} ${my??0}–${opp??0}</span>`;
       }
+      // Build scoreline chips with actual match scores
+      const poolTeamResults = MATCH_RESULTS_BY_TEAM[t.name] || [];
       const chips = rs.length
-        ? rs.map(r=>`<span class="chip chip-${r.outcome}">${PS[r.phase]} ${r.outcome[0].toUpperCase()+r.outcome.slice(1)} +${r.pts}${r.auto?' ✓':''}</span>`).join('')+liveChip
+        ? rs.map(r=>{
+            const matchInfo = poolTeamResults[rs.indexOf(r)] || null;
+            let label;
+            if(matchInfo){
+              label = `${matchInfo.myScore}–${matchInfo.oppScore} vs ${matchInfo.opp}`;
+            } else {
+              label = `${PS[r.phase]} ${r.outcome[0].toUpperCase()+r.outcome.slice(1)}`;
+            }
+            return `<span class="chip chip-${r.outcome}" title="+${r.pts} pts">${label}</span>`;
+          }).join('')+liveChip
         : liveChip || `<span class="chip chip-none">No results yet</span>`;
       return `<div class="team-row">
         <div class="team-row-left"><span class="tr-flag">${t.flag||'🏳️'}</span>
@@ -773,7 +825,7 @@ function renderLeaderboard(){
     return `<div class="entry-card${rk===1?' rank-1':''}" onclick="this.classList.toggle('expanded')">
       <div class="entry-top">
         <div class="rank-num ${rc}">${rk}</div>
-        <div class="entry-name">${p.name}</div>
+        <div class="entry-name">${p.name}${getRankMove(p.id, rk)}</div>
         <div class="entry-score-block">
           <div class="entry-score">${Math.round(p.score*10)/10}</div>
           <div class="entry-score-label">pts</div>
@@ -905,28 +957,255 @@ function logResult(){
 function removeResult(id){S.r=S.r.filter(r=>r.id!==id);render();}
 function resetAll(){doneFixtures=new Set();S={p:[],t:[],r:[],seeded:false};seedData();render();}
 function switchTab(tab){
-  ['leaderboard','teams','results','scoring','manage'].forEach(t=>document.getElementById(`tab-${t}`).classList.toggle('hidden',t!==tab));
-  document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['leaderboard','teams','results','scoring','manage'][i]===tab));
+  ['leaderboard','teams','results','scenarios','scoring','manage'].forEach(t=>document.getElementById(`tab-${t}`).classList.toggle('hidden',t!==tab));
+  document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['leaderboard','teams','results','scenarios','scoring','manage'][i]===tab));
+  if(tab==='scenarios') renderScenarios();
 }
 
 // ─── STATIC MATCH DATA (for Results tab scaffolding) ──────────────────────────
+// ─── SCENARIOS TAB ───────────────────────────────────────────────────────────
+// Upcoming matches in pool order — expand as tournament progresses
+const UPCOMING_MATCHES = [
+  {g:'J',hf:'🇦🇷',h:'Argentina',af:'🇩🇿',a:'Algeria',  date:'Jun 16'},
+  {g:'J',hf:'🇦🇹',h:'Austria',  af:'🇯🇴',a:'Jordan',   date:'Jun 16'},
+  {g:'K',hf:'🇵🇹',h:'Portugal', af:'🇨🇩',a:'DR Congo', date:'Jun 17'},
+  {g:'K',hf:'🇺🇿',h:'Uzbekistan',af:'🇨🇴',a:'Colombia',date:'Jun 17'},
+  {g:'L',hf:'🏴󠁧󠁢󠁥󠁮󠁧󠁿',h:'England',  af:'🇭🇷',a:'Croatia',  date:'Jun 17'},
+  {g:'L',hf:'🇬🇭',h:'Ghana',    af:'🇵🇦',a:'Panama',   date:'Jun 17'},
+];
+
+function renderScenarios(){
+  const el = document.getElementById('scenarios-content');
+  const ranked = [...S.p]
+    .map(p=>({...p, score:ownerScore(p.id)}))
+    .sort((a,b)=>b.score-a.score);
+
+  // Helper: simulate what happens if a team wins/draws/loses
+  function projectedPts(pid, extraResults){
+    // extraResults: [{teamName, outcome}]
+    let total = ownerScore(pid);
+    for(const er of extraResults){
+      const t = S.t.find(t=>t.pid===pid && t.name===er.teamName);
+      if(t) total += Math.round(calcPts('group',er.outcome)*multiplierOf(t.rank)*10)/10;
+    }
+    return Math.round(total*10)/10;
+  }
+
+  // Current standings map
+  const currentRankMap = {};
+  ranked.forEach((p,i)=>currentRankMap[p.id]=i+1);
+
+  let html = '';
+
+  // ── Section 1: Upcoming match scenarios ──
+  const upcoming = UPCOMING_MATCHES.filter(m=>{
+    // Only show if neither team has results yet for this game
+    const ht = S.t.find(t=>t.name===m.h), at = S.t.find(t=>t.name===m.a);
+    const hOwner = ht ? S.p.find(p=>p.id===ht.pid) : null;
+    const aOwner = at ? S.p.find(p=>p.id===at.pid) : null;
+    return hOwner || aOwner; // at least one pool team involved
+  });
+
+  if(upcoming.length){
+    html += '<div class="scenario-section"><h3>Next Games — What Could Change</h3>';
+    for(const m of upcoming.slice(0,6)){
+      const ht = S.t.find(t=>t.name===m.h), at = S.t.find(t=>t.name===m.a);
+      const hOwner = ht ? S.p.find(p=>p.id===ht.pid) : null;
+      const aOwner = at ? S.p.find(p=>p.id===at.pid) : null;
+      if(!hOwner && !aOwner) continue;
+
+      const outcomes = ['win','draw','loss'];
+      const items = [];
+
+      // For each outcome: calculate impact on pool owners + any rank changes
+      for(const outcome of outcomes){
+        const hOut = outcome, aOut = outcome==='win'?'loss':outcome==='loss'?'win':'draw';
+        const hPts = ht ? Math.round(calcPts('group',hOut)*multiplierOf(ht.rank)*10)/10 : 0;
+        const aPts = at ? Math.round(calcPts('group',aOut)*multiplierOf(at.rank)*10)/10 : 0;
+        const outLabel = outcome==='win' ? `${m.h} win` : outcome==='draw' ? 'Draw' : `${m.a} win`;
+
+        // Simulate new standings
+        const simRanked = ranked.map(p=>{
+          let extra = 0;
+          if(hOwner && p.id===hOwner.id) extra+=hPts;
+          if(aOwner && p.id===aOwner.id) extra+=aPts;
+          return {...p, simScore: p.score+extra};
+        }).sort((a,b)=>b.simScore-a.simScore);
+
+        const simRankMap = {};
+        simRanked.forEach((p,i)=>simRankMap[p.id]=i+1);
+
+        // Find interesting rank changes among pool owners
+        const changes = [];
+        if(hOwner){
+          const cur=currentRankMap[hOwner.id], sim=simRankMap[hOwner.id];
+          if(hPts>0) changes.push(`${hOwner.name} +${hPts} pts${cur!==sim?' → moves to #'+sim:''}`);
+        }
+        if(aOwner && aOwner!==hOwner){
+          const cur=currentRankMap[aOwner.id], sim=simRankMap[aOwner.id];
+          if(aPts>0) changes.push(`${aOwner.name} +${aPts} pts${cur!==sim?' → moves to #'+sim:''}`);
+        }
+        // Also note if non-involved owners get leapfrogged
+        for(const p of ranked){
+          if(p.id===hOwner?.id||p.id===aOwner?.id) continue;
+          const cur=currentRankMap[p.id], sim=simRankMap[p.id];
+          if(sim>cur) changes.push(`${p.name} drops to #${sim}`);
+        }
+        if(changes.length){
+          const icon = outcome==='win'?'⚽':outcome==='draw'?'🤝':'❌';
+          items.push(`<div class="scenario-item"><span class="scenario-icon">${icon}</span><span><strong>${outLabel}:</strong> ${changes.slice(0,3).join(' · ')}</span></div>`);
+        }
+      }
+
+      if(items.length){
+        const isHot = (ht&&multiplierOf(ht.rank)>1)||(at&&multiplierOf(at.rank)>1);
+        html += `<div class="scenario-card${isHot?' hot':''}">
+          <div class="scenario-match">${m.hf} ${m.h} vs ${m.af} ${m.a} <span class="scenario-match-badge">Group ${m.g} · ${m.date}</span></div>
+          <div class="scenario-items">${items.join('')}</div>
+        </div>`;
+      }
+    }
+    html += '</div>';
+  }
+
+  // ── Section 2: "Just needs…" — players close to moving up ──
+  html += '<div class="scenario-section"><h3>On The Bubble — One Result Away</h3>';
+  let bubbleFound = false;
+  for(let i=1; i<ranked.length; i++){
+    const behind = ranked[i], ahead = ranked[i-1];
+    const gap = Math.round((ahead.score - behind.score)*10)/10;
+    // Find if behind player has any remaining teams that could close this gap
+    const behindTeams = S.t.filter(t=>t.pid===behind.id);
+    for(const bt of behindTeams){
+      const maxPts = Math.round(calcPts('group','win')*multiplierOf(bt.rank)*10)/10;
+      if(maxPts>=gap && gap>0 && gap<20){
+        html += `<div class="scenario-card">
+          <div class="scenario-items">
+            <div class="scenario-item"><span class="scenario-icon">🎯</span>
+            <span><strong>${behind.name}</strong> is <span class="pts-change pts-dn">${gap} pts</span> behind <strong>${ahead.name}</strong> — a ${bt.flag} ${bt.name} win (+${maxPts} pts) puts them ahead</span></div>
+          </div>
+        </div>`;
+        bubbleFound = true;
+        break;
+      } else if(gap>0 && gap<8) {
+        const drawPts = Math.round(calcPts('group','draw')*multiplierOf(bt.rank)*10)/10;
+        if(drawPts>=gap){
+          html += `<div class="scenario-card">
+            <div class="scenario-items">
+              <div class="scenario-item"><span class="scenario-icon">🤝</span>
+              <span><strong>${behind.name}</strong> trails <strong>${ahead.name}</strong> by <span class="pts-change pts-dn">${gap} pts</span> — even a ${bt.flag} ${bt.name} draw (+${drawPts} pts) is enough</span></div>
+            </div>
+          </div>`;
+          bubbleFound = true;
+          break;
+        }
+      }
+    }
+  }
+  if(!bubbleFound) html += '<div class="scenario-card"><div class="scenario-items"><div class="scenario-item"><span class="scenario-icon">📊</span><span>No close battles right now — check back after more results</span></div></div></div>';
+  html += '</div>';
+
+  // ── Section 3: Underdog watch — Tier 3/4 teams yet to play ──
+  const underdogs = S.t.filter(t=>multiplierOf(t.rank)>1 && S.r.filter(r=>r.tid===t.id).length===0);
+  if(underdogs.length){
+    html += '<div class="scenario-section"><h3>🔥 Underdog Watch — Multiplier Teams Yet to Score</h3>';
+    for(const t of underdogs.slice(0,8)){
+      const owner = S.p.find(p=>p.id===t.pid);
+      const winPts = Math.round(calcPts('group','win')*multiplierOf(t.rank)*10)/10;
+      html += `<div class="scenario-card${multiplierOf(t.rank)===2.5?' hot':''}">
+        <div class="scenario-items">
+          <div class="scenario-item"><span class="scenario-icon">${t.flag}</span>
+          <span><strong>${t.name}</strong> (${multiplierOf(t.rank)}× · ${owner?owner.name:'?'}) — a win would be worth <span class="pts-change pts-up">+${winPts} pts</span> · a draw <span class="pts-change pts-neu">+${Math.round(calcPts('group','draw')*multiplierOf(t.rank)*10)/10}</span></span></div>
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  // ── Section 4: Championship scenarios ──
+  html += '<div class="scenario-section"><h3>🏆 Champion Scenarios — Max Possible Scores</h3>';
+  const champScenarios = ranked.map(p=>{
+    const teams = S.t.filter(t=>t.pid===p.id);
+    // Best case: champion (28pts group wins + advancement = 28 bonus + 6 group wins + 2 KO wins avg)
+    const currentScore = ownerScore(p.id);
+    // rough max: 3 group wins + round of 32 win + r16 win + qf win + sf win + champion = 9+3+3+3+3+28 = 49 raw
+    const maxRaw = 49;
+    const bestTeam = teams.reduce((best,t)=>multiplierOf(t.rank)>multiplierOf(best.rank)?t:best, teams[0]);
+    const maxPossible = bestTeam ? Math.round(maxRaw * multiplierOf(bestTeam.rank) * 10)/10 : 0;
+    const otherTeamsMax = teams.filter(t=>t!==bestTeam).reduce((sum,t)=>{
+      return sum + Math.round(9*multiplierOf(t.rank)*10)/10; // 3 group wins each
+    },0);
+    const teamMax = currentScore + maxPossible + otherTeamsMax;
+    return {...p, teamMax};
+  }).sort((a,b)=>b.teamMax-a.teamMax);
+
+  for(const p of champScenarios.slice(0,5)){
+    const teams = S.t.filter(t=>t.pid===p.id).sort((a,b)=>multiplierOf(b.rank)-multiplierOf(a.rank));
+    const bestTeam = teams[0];
+    html += `<div class="scenario-card">
+      <div class="scenario-items">
+        <div class="scenario-item"><span class="scenario-icon">👑</span>
+        <span><strong>${p.name}</strong> — current: <strong>${Math.round(p.score*10)/10} pts</strong> · theoretical max if ${bestTeam?bestTeam.flag+' '+bestTeam.name+' wins it all':''}: <span class="pts-change pts-up">~${Math.round(p.teamMax)} pts</span></span></div>
+      </div>
+    </div>`;
+  }
+  html += '</div>';
+
+  el.innerHTML = html || '<div class="scenario-no-games">No upcoming pool matches to analyze yet.</div>';
+  if(window.twemoji) twemoji.parse(el, {folder:'svg', ext:'.svg'});
+}
+
+// Quick lookup: team name -> [{opp, hScore, aScore, isHome, date, group}]
+const MATCH_RESULTS_BY_TEAM = (()=>{
+  const lookup = {};
+  const add = (h,hs,as,a,g,d) => {
+    if(!lookup[h]) lookup[h]=[];
+    if(!lookup[a]) lookup[a]=[];
+    lookup[h].push({opp:a,myScore:hs,oppScore:as,group:g,date:d});
+    lookup[a].push({opp:h,myScore:as,oppScore:hs,group:g,date:d});
+  };
+  add('Mexico',2,0,'South Africa','A','Jun 11');
+  add('South Korea',2,1,'Czech Republic','A','Jun 11');
+  add('USA',4,1,'Paraguay','D','Jun 12');
+  add('Canada',1,1,'Bosnia','B','Jun 12');
+  add('Brazil',1,1,'Morocco','C','Jun 13');
+  add('Scotland',1,0,'Haiti','C','Jun 13');
+  add('Switzerland',1,1,'Qatar','B','Jun 13');
+  add('Australia',2,0,'Turkey','D','Jun 13');
+  add('Germany',7,1,'Curaçao','E','Jun 14');
+  add('Ivory Coast',1,0,'Ecuador','E','Jun 14');
+  add('Netherlands',2,2,'Japan','F','Jun 14');
+  add('Sweden',5,1,'Tunisia','F','Jun 14');
+  add('Spain',0,0,'Cape Verde','H','Jun 15');
+  add('Belgium',1,1,'Egypt','G','Jun 15');
+  add('Saudi Arabia',1,1,'Uruguay','H','Jun 15');
+  add('Iran',2,2,'New Zealand','G','Jun 15');
+  add('France',3,1,'Senegal','I','Jun 16');
+  add('Norway',4,1,'Iraq','I','Jun 16');
+  return lookup;
+})();
+
 const SEED_MATCHES=[
-  {g:'A',d:'Jun 11',hf:'🇲🇽',h:'Mexico',      score:'2–0',af:'🇿🇦',a:'South Africa'},
-  {g:'A',d:'Jun 11',hf:'🇰🇷',h:'South Korea', score:'2–1',af:'🇨🇿',a:'Czech Republic'},
-  {g:'D',d:'Jun 12',hf:'🇺🇸',h:'USA',          score:'4–1',af:'🇵🇾',a:'Paraguay'},
-  {g:'B',d:'Jun 12',hf:'🇨🇦',h:'Canada',       score:'1–1',af:'🇧🇦',a:'Bosnia'},
-  {g:'C',d:'Jun 13',hf:'🇧🇷',h:'Brazil',       score:'1–1',af:'🇲🇦',a:'Morocco'},
-  {g:'C',d:'Jun 13',hf:'🏴󠁧󠁢󠁳󠁣󠁴󠁿',h:'Scotland',   score:'1–0',af:'🇭🇹',a:'Haiti'},
-  {g:'B',d:'Jun 13',hf:'🇨🇭',h:'Switzerland', score:'1–1',af:'🇶🇦',a:'Qatar'},
-  {g:'D',d:'Jun 13',hf:'🇦🇺',h:'Australia',   score:'2–0',af:'🇹🇷',a:'Turkey'},
-  {g:'E',d:'Jun 14',hf:'🇩🇪',h:'Germany',     score:'7–1',af:'🇨🇼',a:'Curaçao'},
-  {g:'E',d:'Jun 14',hf:'🇨🇮',h:'Ivory Coast', score:'1–0',af:'🇪🇨',a:'Ecuador'},
-  {g:'F',d:'Jun 14',hf:'🇳🇱',h:'Netherlands', score:'2–2',af:'🇯🇵',a:'Japan'},
-  {g:'F',d:'Jun 14',hf:'🇸🇪',h:'Sweden',      score:'5–1',af:'🇹🇳',a:'Tunisia'},
-  {g:'H',d:'Jun 15',hf:'🇪🇸',h:'Spain',       score:'0–0',af:'🇨🇻',a:'Cape Verde'},
-  {g:'G',d:'Jun 15',hf:'🇧🇪',h:'Belgium',     score:null, af:'🇪🇬',a:'Egypt'},
-  {g:'H',d:'Jun 15',hf:'🇸🇦',h:'Saudi Arabia',score:null, af:'🇺🇾',a:'Uruguay'},
-  {g:'G',d:'Jun 15',hf:'🇮🇷',h:'Iran',        score:null, af:'🇳🇿',a:'New Zealand'},
+  {g:'A',d:'Jun 11',hf:'🇲🇽',h:'Mexico',       score:'2–0',af:'🇿🇦',a:'South Africa'},
+  {g:'A',d:'Jun 11',hf:'🇰🇷',h:'South Korea',  score:'2–1',af:'🇨🇿',a:'Czech Republic'},
+  {g:'D',d:'Jun 12',hf:'🇺🇸',h:'USA',           score:'4–1',af:'🇵🇾',a:'Paraguay'},
+  {g:'B',d:'Jun 12',hf:'🇨🇦',h:'Canada',        score:'1–1',af:'🇧🇦',a:'Bosnia'},
+  {g:'C',d:'Jun 13',hf:'🇧🇷',h:'Brazil',        score:'1–1',af:'🇲🇦',a:'Morocco'},
+  {g:'C',d:'Jun 13',hf:'🏴󠁧󠁢󠁳󠁣󠁴󠁿',h:'Scotland',    score:'1–0',af:'🇭🇹',a:'Haiti'},
+  {g:'B',d:'Jun 13',hf:'🇨🇭',h:'Switzerland',  score:'1–1',af:'🇶🇦',a:'Qatar'},
+  {g:'D',d:'Jun 13',hf:'🇦🇺',h:'Australia',    score:'2–0',af:'🇹🇷',a:'Turkey'},
+  {g:'E',d:'Jun 14',hf:'🇩🇪',h:'Germany',      score:'7–1',af:'🇨🇼',a:'Curaçao'},
+  {g:'E',d:'Jun 14',hf:'🇨🇮',h:'Ivory Coast',  score:'1–0',af:'🇪🇨',a:'Ecuador'},
+  {g:'F',d:'Jun 14',hf:'🇳🇱',h:'Netherlands',  score:'2–2',af:'🇯🇵',a:'Japan'},
+  {g:'F',d:'Jun 14',hf:'🇸🇪',h:'Sweden',       score:'5–1',af:'🇹🇳',a:'Tunisia'},
+  {g:'H',d:'Jun 15',hf:'🇪🇸',h:'Spain',        score:'0–0',af:'🇨🇻',a:'Cape Verde'},
+  {g:'G',d:'Jun 15',hf:'🇧🇪',h:'Belgium',      score:'1–1',af:'🇪🇬',a:'Egypt'},
+  {g:'H',d:'Jun 15',hf:'🇸🇦',h:'Saudi Arabia', score:'1–1',af:'🇺🇾',a:'Uruguay'},
+  {g:'G',d:'Jun 15',hf:'🇮🇷',h:'Iran',         score:'2–2',af:'🇳🇿',a:'New Zealand'},
+  {g:'I',d:'Jun 16',hf:'🇫🇷',h:'France',       score:'3–1',af:'🇸🇳',a:'Senegal'},
+  {g:'I',d:'Jun 16',hf:'🇮🇶',h:'Iraq',         score:'1–4',af:'🇳🇴',a:'Norway'},
+  {g:'J',d:'Jun 16',hf:'🇦🇷',h:'Argentina',    score:null, af:'🇩🇿',a:'Algeria'},
+  {g:'J',d:'Jun 16',hf:'🇦🇹',h:'Austria',      score:null, af:'🇯🇴',a:'Jordan'},
 ];
 
 // ─── SEED POOL DATA ───────────────────────────────────────────────────────────
@@ -972,6 +1251,13 @@ function seedData(){
   add('Netherlands','group','draw','seed_NetherlandsJapan_h');  add('Japan','group','draw','seed_NetherlandsJapan_a');
   add('Sweden','group','win','seed_SwedenTunisia_h');           add('Tunisia','group','loss','seed_SwedenTunisia_a');
   add('Spain','group','draw','seed_SpainCapeVerde_h');          add('Cape Verde','group','draw','seed_SpainCapeVerde_a');
+  // Jun 15
+  add('Belgium','group','draw','seed_BelgiumEgypt_h');          add('Egypt','group','draw','seed_BelgiumEgypt_a');
+  add('Saudi Arabia','group','draw','seed_SaudiUruguay_h');     add('Uruguay','group','draw','seed_SaudiUruguay_a');
+  add('Iran','group','draw','seed_IranNZ_h');                   add('New Zealand','group','draw','seed_IranNZ_a');
+  // Jun 16 (completed)
+  add('France','group','win','seed_FranceSenegal_h');           add('Senegal','group','loss','seed_FranceSenegal_a');
+  add('Norway','group','win','seed_NorwayIraq_h');              add('Iraq','group','loss','seed_NorwayIraq_a');
   S.seeded=true; save();
 }
 
