@@ -325,7 +325,7 @@ img.emoji {
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v16 · build Jun 17 · worker-live</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v17 · build Jun 18 · dedup + daily-reset</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -452,32 +452,52 @@ function calcPts(phase,outcome){
 function fmtTime(t){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 
 // ─── NAME NORMALISATION ───────────────────────────────────────────────────────
-// API-Football may return different spellings — map to our pool names
+// Different data sources spell teams differently. Map every variant to ONE name.
 const NMAP={
   'mexico':'Mexico','south africa':'South Africa','south korea':'South Korea',
-  'korea republic':'South Korea','korea dpr':'North Korea',
+  'korea republic':'South Korea','republic of korea':'South Korea','korea dpr':'North Korea',
   'czech republic':'Czech Republic','czechia':'Czech Republic',
-  'canada':'Canada','bosnia':'Bosnia','bosnia and herzegovina':'Bosnia',
+  'canada':'Canada',
+  'bosnia':'Bosnia','bosnia and herzegovina':'Bosnia','bosnia herzegovina':'Bosnia',
+  'bosnia & herzegovina':'Bosnia','bosniaherzegovina':'Bosnia','bih':'Bosnia',
   'qatar':'Qatar','switzerland':'Switzerland','brazil':'Brazil',
   'morocco':'Morocco','scotland':'Scotland','haiti':'Haiti',
-  'usa':'USA','united states':'USA','us':'USA',
+  'usa':'USA','united states':'USA','united states of america':'USA','us':'USA',
   'paraguay':'Paraguay','australia':'Australia',
-  'turkey':'Turkey','türkiye':'Turkey','turkiye':'Turkey',
-  'germany':'Germany','curaçao':'Curaçao','curacao':'Curaçao',
-  'ivory coast':'Ivory Coast',"côte d'ivoire":'Ivory Coast',"cote d'ivoire":'Ivory Coast',
-  'ecuador':'Ecuador','netherlands':'Netherlands','japan':'Japan',
+  'turkey':'Turkey','turkiye':'Turkey',
+  'germany':'Germany','curacao':'Curaçao',
+  'ivory coast':'Ivory Coast',"cote d'ivoire":'Ivory Coast','cote divoire':'Ivory Coast','cote d ivoire':'Ivory Coast',
+  'ecuador':'Ecuador','netherlands':'Netherlands','holland':'Netherlands','japan':'Japan',
   'sweden':'Sweden','tunisia':'Tunisia','spain':'Spain',
-  'cape verde':'Cape Verde','cabo verde':'Cape Verde',
-  'belgium':'Belgium','egypt':'Egypt','saudi arabia':'Saudi Arabia',
-  'uruguay':'Uruguay','iran':'Iran','new zealand':'New Zealand',
+  'cape verde':'Cape Verde','cabo verde':'Cape Verde','cape verde islands':'Cape Verde',
+  'belgium':'Belgium','egypt':'Egypt','saudi arabia':'Saudi Arabia','ksa':'Saudi Arabia',
+  'uruguay':'Uruguay','iran':'Iran','ir iran':'Iran','new zealand':'New Zealand',
   'france':'France','senegal':'Senegal','iraq':'Iraq','norway':'Norway',
   'argentina':'Argentina','algeria':'Algeria','austria':'Austria',
-  'jordan':'Jordan','portugal':'Portugal','dr congo':'DR Congo',
-  'democratic republic of congo':'DR Congo','congo dr':'DR Congo',
+  'jordan':'Jordan','portugal':'Portugal',
+  'dr congo':'DR Congo','democratic republic of congo':'DR Congo','congo dr':'DR Congo',
+  'congo democratic republic':'DR Congo','drc':'DR Congo',
   'uzbekistan':'Uzbekistan','colombia':'Colombia','england':'England',
   'croatia':'Croatia','ghana':'Ghana','panama':'Panama',
 };
-function normName(n){return NMAP[(n||'').toLowerCase().trim()]||(n||'');}
+// Strip accents, punctuation, and collapse whitespace before lookup so variants
+// like "Bosnia & Herzegovina", "Bosnia-Herzegovina", "Türkiye" all match.
+function canonKey(n){
+  return (n||'')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // strip accents
+    .replace(/[&\-_.']/g,' ')                          // punctuation → space
+    .replace(/\s+/g,' ')                                // collapse spaces
+    .trim();
+}
+function normName(n){
+  const key = canonKey(n);
+  if(NMAP[key]) return NMAP[key];
+  // also try the raw lowercased form as a fallback
+  const raw = (n||'').toLowerCase().trim();
+  if(NMAP[raw]) return NMAP[raw];
+  return (n||'');
+}
 function findPoolTeam(apiName){
   const norm=normName(apiName);
   return S.t.find(t=>t.name.toLowerCase()===norm.toLowerCase());
@@ -722,10 +742,19 @@ function detectPhaseFDO(stage, group){
   return 'group';
 }
 
-// Get YYYY-MM-DD string offset by N days from today
+// Get YYYY-MM-DD string offset by N days from today (UTC — for API fixture queries)
 function dateStr(offsetDays=0){
   const d = new Date(); d.setDate(d.getDate()+offsetDays);
   return d.toISOString().slice(0,10);
+}
+// Local calendar date (YYYY-MM-DD) — used for the daily +/- snapshot so it
+// resets at the user's local midnight, not UTC midnight.
+function localDateStr(){
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
 }
 
 // Fetch fixtures for a given date, process finished ones, update live state
@@ -1021,7 +1050,7 @@ let dailySnap = JSON.parse(localStorage.getItem('wc26_dailysnap_v12')||'null');
 // dailySnap = { date:'YYYY-MM-DD', ranks:{pid:rank} }
 
 function maybeRollDailySnapshot(rankedConfirmed){
-  const today = dateStr(0);
+  const today = localDateStr();
   if(!dailySnap || dailySnap.date !== today){
     // New day (or first ever) — capture this morning's standings as the baseline.
     // Use CONFIRMED scores (no live) so the baseline is stable.
@@ -1657,14 +1686,24 @@ function seedData(){
 }
 
 // ─── ONE-TIME DEDUP REPAIR ────────────────────────────────────────────────────
-// Collapses duplicate results (same team+phase+outcome+scoreline) that may have
-// been double-logged by earlier versions. Keeps the first of each.
+// Collapses duplicate results for the same team in the same match. Earlier versions
+// (or mismatched team-name spellings across data sources, e.g. "Bosnia" vs
+// "Bosnia and Herzegovina") could log the same game twice. We dedup on
+// team + phase + opponent, where opponent is normalised so spelling variants collapse.
 function repairDuplicates(){
   const seen = new Set();
   const cleaned = [];
   for(const r of S.r){
-    // identity = team + phase + scoreline (or outcome if no scoreline)
-    const id = `${r.tid}|${r.phase}|${r.scoreline||r.outcome}`;
+    // Extract opponent from scoreline ("1–1 vs Bosnia and Herzegovina") and normalise it
+    let oppKey = r.outcome;
+    if(r.scoreline){
+      const m = r.scoreline.match(/vs\s+(.+)$/i);
+      if(m) oppKey = normName(m[1].trim());
+      // also fold the score numbers in so different real matches vs same opp still differ
+      const sc = r.scoreline.match(/^(\d+)\D+(\d+)/);
+      if(sc) oppKey = `${normName(m?m[1].trim():'')}_${Math.min(+sc[1],+sc[2])}-${Math.max(+sc[1],+sc[2])}`;
+    }
+    const id = `${r.tid}|${r.phase}|${oppKey}`;
     if(seen.has(id)) continue;
     seen.add(id);
     cleaned.push(r);
@@ -1672,7 +1711,6 @@ function repairDuplicates(){
   if(cleaned.length !== S.r.length){
     debugLog(`Repaired ${S.r.length - cleaned.length} duplicate result(s)`);
     S.r = cleaned;
-    // Rebuild doneFixtures from cleaned results so future fetches dedup correctly
     save();
   }
 }
