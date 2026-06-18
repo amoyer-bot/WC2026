@@ -306,22 +306,26 @@ img.emoji {
       <div class="manage-card">
         <h3>🔴 Live Scores Setup</h3>
         <div class="notice-blue">
-          <strong>Recommended:</strong> get a free key at <a href="https://www.football-data.org/client/register" target="_blank">football-data.org/client/register</a> — it works <strong>directly from the browser</strong> (no proxy needed) and World Cup is free forever.<br><br>
-          Paste it below. The dashboard polls every 60s during live games, every 15 min otherwise. If no key is set, completed scores still load automatically from the free openfootball feed.
+          <strong>Cloudflare Worker</strong> (one-time ~10 min setup → truly live).<br>
+          The Worker holds your API-Football key and adds the CORS headers browsers need.<br><br>
+          1. Free account at <a href="https://dash.cloudflare.com/sign-up" target="_blank">cloudflare.com</a><br>
+          2. Create a Worker, paste the provided <code>wc26-worker.js</code> code<br>
+          3. Add your API-Football key as a secret named <code>API_FOOTBALL_KEY</code><br>
+          4. Deploy, paste your Worker URL below
         </div>
         <div class="form-row">
-          <label class="form-label">football-data.org Key (recommended)</label>
-          <input type="password" class="form-input" id="fdo-key-input" placeholder="Paste football-data.org key…" autocomplete="off">
+          <label class="form-label">Cloudflare Worker URL (recommended)</label>
+          <input type="text" class="form-input" id="worker-url-input" placeholder="https://wc26.yourname.workers.dev" autocomplete="off">
         </div>
         <div class="form-row">
-          <label class="form-label">API-Football Key (optional backup)</label>
-          <input type="password" class="form-input" id="api-key-input" placeholder="Optional — routed via CORS proxy…" autocomplete="off">
+          <label class="form-label">API-Football Key (only if not using a Worker)</label>
+          <input type="password" class="form-input" id="api-key-input" placeholder="Optional fallback…" autocomplete="off">
         </div>
         <button class="btn btn-primary" onclick="saveKey()">Save & Activate</button>
         <button class="btn" onclick="forceRefresh()" style="margin-top:6px;">↻ Force Refresh Scores Now</button>
         <button class="btn btn-danger" onclick="hardReset()" style="margin-top:6px;">⚠ Hard Reset (reload seed + data)</button>
         <div class="key-status" id="key-status"></div>
-        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v15 · build Jun 17 · crash-fixed</div>
+        <div style="font-size:9px;color:var(--silver-dim);margin-top:8px;text-align:center;">Data v16 · build Jun 17 · worker-live</div>
         <div style="margin-top:12px;">
           <div style="font-size:10px;letter-spacing:1px;color:var(--silver-dim);text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
             <span>API Debug Log</span>
@@ -483,6 +487,7 @@ function findPoolTeam(apiName){
 let S = JSON.parse(localStorage.getItem('wc26_v12')||'null') || {p:[],t:[],r:[],seeded:false};
 let apiKey = localStorage.getItem('wc26_key') || '';
 let fdoKey = localStorage.getItem('wc26_fdokey') || '';
+let workerUrl = localStorage.getItem('wc26_workerurl') || '';
 // Track which fixture IDs we've already committed as final so we don't double-log
 let doneFixtures = new Set(JSON.parse(localStorage.getItem('wc26_done_v12')||'[]'));
 // Daily request counter (resets at midnight)
@@ -573,44 +578,45 @@ function ownerScore(pid, includeLive=true){
 function isFileProtocol(){ return location.protocol === 'file:'; }
 
 async function apiFetch(endpoint, skipCount=false){
-  if(!apiKey) return null;
-  if(!skipCount){ reqCount++; saveReqCount(); }
-  const directUrl = `${API_DIRECT}${endpoint}`;
-
-  // Try proxies starting from the last one that worked
-  for(let attempt=0; attempt<CORS_PROXIES.length; attempt++){
-    const idx = (workingProxyIdx + attempt) % CORS_PROXIES.length;
-    const proxiedUrl = CORS_PROXIES[idx](directUrl);
+  // PREFERRED: call through the user's Cloudflare Worker (holds the key server-side,
+  // adds CORS headers, no public proxy). Falls back to public proxies only if no Worker set.
+  if(workerUrl){
+    if(!skipCount){ reqCount++; saveReqCount(); }
+    const u = `${workerUrl}${workerUrl.includes('?')?'&':'?'}path=${encodeURIComponent(endpoint)}`;
     try{
-      const r = await fetch(proxiedUrl, {
-        headers: { 'x-apisports-key': apiKey, 'Accept':'application/json' }
-      });
-      if(!r.ok){
-        debugLog(`Proxy ${idx} HTTP ${r.status}`);
-        continue; // try next proxy
-      }
-      const text = await r.text();
-      let json;
-      try{ json = JSON.parse(text); }
-      catch(e){ debugLog(`Proxy ${idx} bad JSON`); continue; }
-      // Check API-level errors (bad key etc.)
+      const r = await fetch(u, { headers:{'Accept':'application/json'} });
+      if(!r.ok){ debugLog(`Worker HTTP ${r.status}`); return { _httpError:r.status }; }
+      const json = await r.json();
       if(json.errors && (Array.isArray(json.errors)?json.errors.length:Object.keys(json.errors).length)){
         debugLog(`API error: ${JSON.stringify(json.errors)}`);
         return { _apiError: json.errors };
       }
-      // Success — remember this proxy
-      if(idx !== workingProxyIdx){
-        workingProxyIdx = idx;
-        localStorage.setItem('wc26_proxyidx', String(idx));
-        debugLog(`Switched to proxy ${idx}`);
-      }
       return json;
     }catch(e){
-      debugLog(`Proxy ${idx} failed: ${e.message}`);
-      continue;
+      debugLog(`Worker fetch failed: ${e.message}`);
+      return { _corsError: e.message };
     }
   }
-  debugLog('All proxies failed — will try openfootball fallback');
+
+  // FALLBACK: public CORS proxies (flaky) — only used if no Worker URL configured
+  if(!apiKey) return null;
+  if(!skipCount){ reqCount++; saveReqCount(); }
+  const directUrl = `${API_DIRECT}${endpoint}`;
+  for(let attempt=0; attempt<CORS_PROXIES.length; attempt++){
+    const idx = (workingProxyIdx + attempt) % CORS_PROXIES.length;
+    const proxiedUrl = CORS_PROXIES[idx](directUrl);
+    try{
+      const r = await fetch(proxiedUrl, { headers: { 'x-apisports-key': apiKey, 'Accept':'application/json' } });
+      if(!r.ok){ debugLog(`Proxy ${idx} HTTP ${r.status}`); continue; }
+      const text = await r.text();
+      let json; try{ json = JSON.parse(text); }catch(e){ debugLog(`Proxy ${idx} bad JSON`); continue; }
+      if(json.errors && (Array.isArray(json.errors)?json.errors.length:Object.keys(json.errors).length)){
+        return { _apiError: json.errors };
+      }
+      if(idx !== workingProxyIdx){ workingProxyIdx = idx; localStorage.setItem('wc26_proxyidx', String(idx)); }
+      return json;
+    }catch(e){ debugLog(`Proxy ${idx} failed: ${e.message}`); continue; }
+  }
   return { _corsError: 'all proxies failed' };
 }
 
@@ -912,21 +918,27 @@ function startPolling(){
 }
 
 // Unified fetch: try sources in order of reliability.
-// 1) football-data.org (CORS-native, best) → 2) API-Football via proxy → 3) openfootball (finals only)
+// 1) API-Football via Cloudflare Worker (best — real live + events, no CORS issues)
+// 2) football-data.org / API-Football via public proxy (flaky)
+// 3) openfootball (finals only, always works)
 async function doMasterFetch(){
-  // 1. football-data.org — works directly, includes live + finals
+  // 1. API-Football through the user's Worker — the reliable live path
+  if(workerUrl){
+    const live = await fetchAllRecent();
+    if(live !== null && (todayFixtures.length || liveFixtures.length)) return;
+    debugLog('Worker returned no fixtures, trying fallbacks');
+  }
+  // 2. football-data.org via public proxy
   if(fdoKey){
     const ok = await fetchFootballData();
     if(ok) return;
-    debugLog('football-data.org returned nothing, trying next source');
   }
-  // 2. API-Football via CORS proxy — live + events
-  if(apiKey){
+  // 3. API-Football via public proxy (only if no Worker)
+  if(apiKey && !workerUrl){
     const live = await fetchAllRecent();
     if(live !== null && (todayFixtures.length || liveFixtures.length)) return;
-    debugLog('API-Football empty, falling back to openfootball');
   }
-  // 3. openfootball — completed scores only, no key needed
+  // 4. openfootball — completed scores, no key needed
   await fetchOpenFootball();
 }
 
@@ -956,37 +968,46 @@ function debugLog(msg){
 }
 
 function saveKey(){
-  const fdoVal = document.getElementById('fdo-key-input').value.trim();
+  const wVal = document.getElementById('worker-url-input').value.trim().replace(/\/$/,'');
   const apiVal = document.getElementById('api-key-input').value.trim();
   const ks = document.getElementById('key-status');
   ks.style.display='block';
 
-  if(!fdoVal && !apiVal){
+  if(!wVal && !apiVal){
     ks.className='key-status err';
-    ks.textContent='Enter at least one key (football-data.org recommended).';
+    ks.textContent='Enter your Cloudflare Worker URL (recommended) or an API-Football key.';
     return;
   }
 
-  // Save both keys
-  if(fdoVal){ fdoKey = fdoVal; localStorage.setItem('wc26_fdokey', fdoKey); }
+  if(wVal){ workerUrl = wVal; localStorage.setItem('wc26_workerurl', workerUrl); }
   if(apiVal){ apiKey = apiVal; localStorage.setItem('wc26_key', apiKey); }
 
   ks.className='key-status ok'; ks.textContent='Testing connection…';
 
-  // Test via the same proxy path the app uses (direct browser calls are blocked)
-  if(fdoKey){
-    fetchFootballData().then(ok=>{
-      if(ok){
-        ks.className='key-status ok';
-        ks.textContent='✓ football-data.org connected via proxy — scores active!';
-      } else {
+  if(workerUrl){
+    // Test the Worker with a cheap /status call
+    apiFetch('/status', true).then(d=>{
+      if(d && d._corsError){
         ks.className='key-status err';
-        ks.innerHTML='⚠ football-data.org didn\'t respond through the proxies. The dashboard will still load completed scores from the free openfootball feed automatically.';
+        ks.innerHTML='⚠ Couldn\'t reach the Worker. Check the URL is correct and the Worker is deployed. Completed scores will still load from openfootball.';
+      } else if(d && d._httpError){
+        ks.className='key-status err';
+        ks.textContent=`⚠ Worker returned HTTP ${d._httpError}. Check the API_FOOTBALL_KEY secret is set in the Worker.`;
+      } else if(d && d._apiError){
+        ks.className='key-status err';
+        ks.textContent='⚠ API-Football rejected the key inside the Worker — verify the secret value.';
+      } else if(d && d.response){
+        const reqs = d.response.requests;
+        ks.className='key-status ok';
+        ks.textContent = `✓ Worker live! ${reqs?`${reqs.current}/${reqs.limit_day} req today`:'connected'}`;
+      } else {
+        ks.className='key-status ok';
+        ks.textContent='✓ Worker responded — starting live polling.';
       }
       startPolling();
     });
   } else {
-    ks.textContent='Testing API-Football via proxy…';
+    ks.textContent='Testing API-Football via public proxy (less reliable)…';
     startPolling();
   }
 }
@@ -1268,7 +1289,7 @@ function renderManage(){
     const mp=Math.round(r.pts*mult*10)/10;
     return`<div class="log-item"><div class="log-left"><span>${t?(t.flag||'')+' '+t.name:'?'}</span><span class="phase-tag">${PS[r.phase]}</span><span style="text-transform:capitalize;font-size:10px;">${r.outcome}</span>${r.auto?'<span style="font-size:9px;color:var(--blue-dim);background:rgba(58,111,212,.1);padding:1px 5px;border-radius:3px;">auto</span>':''}</div><div style="display:flex;align-items:center;gap:7px;"><span class="log-pts">+${r.pts}→${mp}</span><button onclick="removeResult('${r.id}')">✕</button></div></div>`;
   }).join('');
-  if(apiKey){const e=document.getElementById('api-key-input');if(e)e.value=apiKey;} if(fdoKey){const e=document.getElementById('fdo-key-input');if(e)e.value=fdoKey;}
+  if(apiKey){const e=document.getElementById('api-key-input');if(e)e.value=apiKey;} if(workerUrl){const e=document.getElementById('worker-url-input');if(e)e.value=workerUrl;}
   saveReqCount();
 }
 
@@ -1662,7 +1683,7 @@ repairDuplicates();
 render();
 saveReqCount();
 // Restore saved keys into inputs
-if(fdoKey) { const el=document.getElementById('fdo-key-input'); if(el) el.value=fdoKey; }
+if(workerUrl) { const el=document.getElementById('worker-url-input'); if(el) el.value=workerUrl; }
 if(apiKey) { const el=document.getElementById('api-key-input'); if(el) el.value=apiKey; }
 
 if(isFileProtocol()){
